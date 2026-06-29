@@ -1,0 +1,32 @@
+[package]
+name = "hop"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Cross-platform bindings for Hop (Swift/Kotlin via UniFFI — DESIGN.md §12)."
+
+[lib]
+# The compiled artifact is `libhop` (the C ABI / universal SDK — see src/cabi.rs + sdk/hop.h),
+# The crate is `hop` and the UniFFI namespace is `hop` (uniffi.hop), matching the lib.
+name = "hop"
+# cdylib/staticlib are what the iOS/Android builds link against; lib keeps it
+# usable from Rust tests and the workspace.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+hop-core.workspace = true
+hop-store-sqlite.workspace = true
+uniffi = "0.28"
+thiserror.workspace = true
+bs58 = "0.5"
+postcard.workspace = true
+
+# Binary that generates the Swift/Kotlin bindings from the compiled library.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
