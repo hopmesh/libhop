@@ -53,9 +53,31 @@ unsafe fn slice<'a>(p: *const u8, len: usize) -> &'a [u8] {
 
 // ---- lifecycle --------------------------------------------------------------------------------
 
+/// The libhop C-ABI version. Bump on any signature or semantic change to an exported `hop_*`
+/// function. A wrapper should assert `hop_abi_version() == HOP_ABI_VERSION` at load so a wrapper
+/// built against a newer header fails loudly instead of drifting silently (F-28). This is the
+/// *ABI* version and is independent of the *wire* format version (bundle.rs `BUNDLE_VERSION`).
+pub const HOP_ABI_VERSION: u32 = 2;
+
+/// Returns the ABI version this shared library implements (see [`HOP_ABI_VERSION`]).
+#[no_mangle]
+pub extern "C" fn hop_abi_version() -> u32 {
+    HOP_ABI_VERSION
+}
+
+/// Run a constructor closure, converting a panic into a NULL return so it never unwinds across
+/// the `extern "C"` boundary (which is undefined behavior). See F-26.
+fn catch_ctor(f: impl FnOnce() -> *const HopNode) -> *const HopNode {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(std::ptr::null())
+}
+
 /// Open a node with persistent storage at `db_path` (UTF-8 C string), a saved 32-byte identity
 /// `secret` (pass NULL/0 for a fresh identity), and a 32-byte `app_secret` (NULL/0 = open fabric).
-/// Returns an owning handle to free with `hop_node_free`, or NULL on a NULL/invalid `db_path`.
+/// Returns an owning handle to free with `hop_node_free`, or NULL on a NULL/non-UTF-8 `db_path`.
+///
+/// If the db path exists but can't be opened it is quarantined and reopened fresh; only if that
+/// also fails does the node run with EPHEMERAL storage (call `hop_node_is_persistent` to detect
+/// this) rather than silently, and rather than NULL (F-26).
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_open(
     db_path: *const c_char,
@@ -67,28 +89,70 @@ pub unsafe extern "C" fn hop_node_open(
     let Some(path) = cstr(db_path) else {
         return std::ptr::null();
     };
-    let node = HopNode::open(
-        path.to_string(),
-        slice(secret, secret_len).to_vec(),
-        slice(app_secret, app_secret_len).to_vec(),
-    );
-    Arc::into_raw(node)
+    let path = path.to_string();
+    let secret = slice(secret, secret_len).to_vec();
+    let app = slice(app_secret, app_secret_len).to_vec();
+    catch_ctor(|| Arc::into_raw(HopNode::open(path, secret, app)))
+}
+
+/// Like `hop_node_open`, but ENCRYPTS the store at rest with a raw `key` (typically 32 bytes) the host
+/// derives and stores in the platform Keychain/Keystore (F-25). Real encryption requires libhop to be
+/// built with the store's `sqlcipher` feature; otherwise the key is accepted but the db stays plain.
+/// A NULL/empty key behaves like `hop_node_open`. NULL/non-UTF-8 `db_path` ⇒ NULL.
+#[no_mangle]
+pub unsafe extern "C" fn hop_node_open_keyed(
+    db_path: *const c_char,
+    secret: *const u8,
+    secret_len: usize,
+    app_secret: *const u8,
+    app_secret_len: usize,
+    key: *const u8,
+    key_len: usize,
+) -> *const HopNode {
+    let Some(path) = cstr(db_path) else {
+        return std::ptr::null();
+    };
+    let path = path.to_string();
+    let secret = slice(secret, secret_len).to_vec();
+    let app = slice(app_secret, app_secret_len).to_vec();
+    let key = slice(key, key_len).to_vec();
+    catch_ctor(|| Arc::into_raw(HopNode::open_keyed(path, secret, app, key)))
 }
 
 /// Create a node with a fresh identity and ephemeral (in-memory) storage. Free with `hop_node_free`.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_new() -> *const HopNode {
-    Arc::into_raw(HopNode::new())
+    catch_ctor(|| Arc::into_raw(HopNode::new()))
 }
 
 /// Open a node from a saved 32-byte identity `secret` with ephemeral (in-memory) storage. Pass
 /// NULL/0 for a fresh identity. Free with `hop_node_free`.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_with_secret(secret: *const u8, secret_len: usize) -> *const HopNode {
-    Arc::into_raw(HopNode::with_secret(slice(secret, secret_len).to_vec()))
+    let secret = slice(secret, secret_len).to_vec();
+    catch_ctor(|| Arc::into_raw(HopNode::with_secret(secret)))
+}
+
+/// Whether this node has durable storage. Returns false when the db path was unusable and the
+/// node is running ephemerally (state will not survive a restart) — the host should surface this
+/// rather than treat the database as ground truth (F-26). NULL handle ⇒ false.
+#[no_mangle]
+pub unsafe extern "C" fn hop_node_is_persistent(node: *const HopNode) -> bool {
+    node_ref(node).map(|n| n.is_persistent()).unwrap_or(false)
+}
+
+/// How many persisted records failed to decode on startup (F-03). Non-zero ⇒ an upgrade changed
+/// a struct's on-disk layout and dropped that state; surface it to the user. NULL handle ⇒ 0.
+#[no_mangle]
+pub unsafe extern "C" fn hop_node_rehydrate_dropped(node: *const HopNode) -> u32 {
+    node_ref(node).map(|n| n.rehydrate_dropped()).unwrap_or(0)
 }
 
 /// Free a node handle returned by any constructor. Safe to pass NULL.
+///
+/// Ownership: this consumes the one strong reference each constructor returned. The caller must
+/// ensure no other thread is calling into the same handle concurrently with free (the ABI does
+/// not expose a retain/clone), and must not use the pointer afterward.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_free(node: *const HopNode) {
     if !node.is_null() {

@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// The libhop C-ABI version. Bump on any signature or semantic change to an exported `hop_*`
+// function. A wrapper should assert `hop_abi_version() == HOP_ABI_VERSION` at load so a wrapper
+// built against a newer header fails loudly instead of drifting silently (F-28). This is the
+// *ABI* version and is independent of the *wire* format version (bundle.rs `BUNDLE_VERSION`).
+#define HOP_ABI_VERSION 2
+
 // Which side opened a bearer link (the Noise role). Mirrors hop-core's internal `Role`.
 typedef enum HopLinkRole {
     // We dialed out (BLE central / TCP connect / Wi-Fi inviter) → Noise initiator.
@@ -26,14 +32,33 @@ typedef struct HopNode HopNode;
 extern "C" {
 #endif // __cplusplus
 
+// Returns the ABI version this shared library implements (see [`HOP_ABI_VERSION`]).
+uint32_t hop_abi_version(void);
+
 // Open a node with persistent storage at `db_path` (UTF-8 C string), a saved 32-byte identity
 // `secret` (pass NULL/0 for a fresh identity), and a 32-byte `app_secret` (NULL/0 = open fabric).
-// Returns an owning handle to free with `hop_node_free`, or NULL on a NULL/invalid `db_path`.
+// Returns an owning handle to free with `hop_node_free`, or NULL on a NULL/non-UTF-8 `db_path`.
+//
+// If the db path exists but can't be opened it is quarantined and reopened fresh; only if that
+// also fails does the node run with EPHEMERAL storage (call `hop_node_is_persistent` to detect
+// this) rather than silently, and rather than NULL (F-26).
 const struct HopNode *hop_node_open(const char *db_path,
                                     const uint8_t *secret,
                                     uintptr_t secret_len,
                                     const uint8_t *app_secret,
                                     uintptr_t app_secret_len);
+
+// Like `hop_node_open`, but ENCRYPTS the store at rest with a raw `key` (typically 32 bytes) the host
+// derives and stores in the platform Keychain/Keystore (F-25). Real encryption requires libhop to be
+// built with the store's `sqlcipher` feature; otherwise the key is accepted but the db stays plain.
+// A NULL/empty key behaves like `hop_node_open`. NULL/non-UTF-8 `db_path` ⇒ NULL.
+const struct HopNode *hop_node_open_keyed(const char *db_path,
+                                          const uint8_t *secret,
+                                          uintptr_t secret_len,
+                                          const uint8_t *app_secret,
+                                          uintptr_t app_secret_len,
+                                          const uint8_t *key,
+                                          uintptr_t key_len);
 
 // Create a node with a fresh identity and ephemeral (in-memory) storage. Free with `hop_node_free`.
 const struct HopNode *hop_node_new(void);
@@ -42,7 +67,20 @@ const struct HopNode *hop_node_new(void);
 // NULL/0 for a fresh identity. Free with `hop_node_free`.
 const struct HopNode *hop_node_with_secret(const uint8_t *secret, uintptr_t secret_len);
 
+// Whether this node has durable storage. Returns false when the db path was unusable and the
+// node is running ephemerally (state will not survive a restart) — the host should surface this
+// rather than treat the database as ground truth (F-26). NULL handle ⇒ false.
+bool hop_node_is_persistent(const struct HopNode *node);
+
+// How many persisted records failed to decode on startup (F-03). Non-zero ⇒ an upgrade changed
+// a struct's on-disk layout and dropped that state; surface it to the user. NULL handle ⇒ 0.
+uint32_t hop_node_rehydrate_dropped(const struct HopNode *node);
+
 // Free a node handle returned by any constructor. Safe to pass NULL.
+//
+// Ownership: this consumes the one strong reference each constructor returned. The caller must
+// ensure no other thread is calling into the same handle concurrently with free (the ABI does
+// not expose a retain/clone), and must not use the pointer afterward.
 void hop_node_free(const struct HopNode *node);
 
 // Write this node's 32-byte address into `out` (must have room for 32 bytes). False on NULL.

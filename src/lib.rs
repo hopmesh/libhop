@@ -390,6 +390,63 @@ fn to32(v: &[u8]) -> std::result::Result<[u8; 32], FfiError> {
 #[derive(uniffi::Object)]
 pub struct HopNode {
     inner: Mutex<Node<SqliteStore>>,
+    /// True iff this node has durable storage. `open` sets it false only when the db path was
+    /// unusable even after quarantine, so the host can tell the difference between persistent
+    /// and silently-ephemeral (F-26). `new`/`with_secret` are ephemeral by construction.
+    persistent: bool,
+    /// How many persisted records failed to decode on startup (F-03) — non-zero means an
+    /// upgrade changed a struct layout and dropped state; the host should surface it.
+    rehydrate_dropped: u32,
+}
+
+/// Open the persistent store, or if the file is unusable, quarantine it and retry once so a
+/// corrupt/read-only db becomes a clean fresh start rather than permanent per-launch amnesia.
+/// Returns `(store, persistent)`; only falls back to in-memory if even a fresh file won't open.
+/// See F-26 — the old code did `open(path).or_else(in_memory)`, so a bad path silently ran
+/// ephemeral forever with no signal to the host.
+fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
+    // F-25: an empty key opens plain; a 32-byte key opens SQLCipher-encrypted (under the store's
+    // `sqlcipher` feature). Same quarantine-on-failure behavior either way.
+    if let Ok(s) = SqliteStore::open_keyed(db_path, key) {
+        return (s, true);
+    }
+    let quarantine = format!("{db_path}.corrupt");
+    let _ = std::fs::remove_file(&quarantine);
+    if std::fs::rename(db_path, &quarantine).is_ok() {
+        if let Ok(s) = SqliteStore::open_keyed(db_path, key) {
+            eprintln!("hop: quarantined unusable db to {quarantine}; started a fresh persistent store");
+            return (s, true);
+        }
+    }
+    eprintln!(
+        "hop: WARNING db path {db_path} is unusable even after quarantine; running EPHEMERAL \
+         (state will NOT survive restart). is_persistent() is false."
+    );
+    (SqliteStore::open_in_memory().expect("in-memory sqlite"), false)
+}
+
+/// Shared body of the `open` / `open_keyed` UniFFI constructors (F-25). A free function because UniFFI
+/// doesn't allow a private associated fn inside an exported impl.
+fn open_node_inner(db_path: &str, secret: &[u8], app_secret: &[u8], key: &[u8]) -> Arc<HopNode> {
+    let (store, persistent) = open_store_persistent(db_path, key);
+    let mut node = Node::with_store(identity_from(secret), store);
+    if let Ok(s) = <[u8; 32]>::try_from(app_secret) {
+        node.set_app_keys(hop_core::app::AppKeys::from_secret(s));
+    }
+    // Surface any state silently lost to a struct-layout change across an upgrade (F-03).
+    let report = node.take_rehydrate_report();
+    if !report.is_empty() {
+        eprintln!(
+            "hop: rehydrate dropped {} persisted record(s) across an upgrade: {:?}",
+            report.total(),
+            report.dropped
+        );
+    }
+    Arc::new(HopNode {
+        inner: Mutex::new(node),
+        persistent,
+        rehydrate_dropped: report.total(),
+    })
 }
 
 #[uniffi::export]
@@ -400,6 +457,8 @@ impl HopNode {
         let store = SqliteStore::open_in_memory().expect("in-memory sqlite");
         Arc::new(Self {
             inner: Mutex::new(Node::with_store(Identity::generate(), store)),
+            persistent: false,
+            rehydrate_dropped: 0,
         })
     }
 
@@ -410,6 +469,8 @@ impl HopNode {
         let store = SqliteStore::open_in_memory().expect("in-memory sqlite");
         Arc::new(Self {
             inner: Mutex::new(Node::with_store(identity_from(&secret), store)),
+            persistent: false,
+            rehydrate_dropped: 0,
         })
     }
 
@@ -417,18 +478,35 @@ impl HopNode {
     /// restarts; bounded — older relayed messages are evicted to make room), a
     /// saved identity secret, and a 32-byte **app secret** that isolates this app's
     /// `hps://` channels/services from other apps (DESIGN.md §32). Pass empty/short
-    /// app-secret bytes to stay on the open shared fabric. Falls back to in-memory
-    /// if the path can't be opened.
+    /// app-secret bytes to stay on the open shared fabric. If the path can't be opened it is
+    /// quarantined and reopened fresh; only if that also fails does it run ephemeral, and then
+    /// [`HopNode::is_persistent`] returns false so the host can tell (F-26).
     #[uniffi::constructor]
     pub fn open(db_path: String, secret: Vec<u8>, app_secret: Vec<u8>) -> Arc<Self> {
-        let store = SqliteStore::open(&db_path)
-            .or_else(|_| SqliteStore::open_in_memory())
-            .expect("sqlite store");
-        let mut node = Node::with_store(identity_from(&secret), store);
-        if let Ok(s) = <[u8; 32]>::try_from(app_secret.as_slice()) {
-            node.set_app_keys(hop_core::app::AppKeys::from_secret(s));
-        }
-        Arc::new(Self { inner: Mutex::new(node) })
+        open_node_inner(&db_path, &secret, &app_secret, &[])
+    }
+
+    /// Like [`HopNode::open`], but ENCRYPTS the store at rest with a raw 32-byte `key` the host derives
+    /// and stores in the platform Keychain/Keystore (F-25). Real encryption requires the store's
+    /// `sqlcipher` cargo feature; without it the key is accepted but the db stays plain. An empty key
+    /// behaves exactly like `open`.
+    #[uniffi::constructor]
+    pub fn open_keyed(db_path: String, secret: Vec<u8>, app_secret: Vec<u8>, key: Vec<u8>) -> Arc<Self> {
+        open_node_inner(&db_path, &secret, &app_secret, &key)
+    }
+
+    /// Whether this node has durable storage. `false` means the db path was unusable and state
+    /// will NOT survive a restart; the host should surface a warning rather than assume the
+    /// database is the ground truth (F-26).
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
+    /// How many persisted records failed to decode on startup (F-03). Non-zero means an upgrade
+    /// changed a struct's on-disk layout and dropped that state; the host should tell the user
+    /// (e.g. queued sends or sessions were lost) instead of it vanishing silently.
+    pub fn rehydrate_dropped(&self) -> u32 {
+        self.rehydrate_dropped
     }
 
     // Note: there is intentionally no `set_app` here. End-user devices must NOT stamp
