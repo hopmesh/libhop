@@ -414,7 +414,9 @@ fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
     let _ = std::fs::remove_file(&quarantine);
     if std::fs::rename(db_path, &quarantine).is_ok() {
         if let Ok(s) = SqliteStore::open_keyed(db_path, key) {
-            eprintln!("hop: quarantined unusable db to {quarantine}; started a fresh persistent store");
+            eprintln!(
+                "hop: quarantined unusable db to {quarantine}; started a fresh persistent store"
+            );
             return (s, true);
         }
     }
@@ -422,7 +424,10 @@ fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
         "hop: WARNING db path {db_path} is unusable even after quarantine; running EPHEMERAL \
          (state will NOT survive restart). is_persistent() is false."
     );
-    (SqliteStore::open_in_memory().expect("in-memory sqlite"), false)
+    (
+        SqliteStore::open_in_memory().expect("in-memory sqlite"),
+        false,
+    )
 }
 
 /// Shared body of the `open` / `open_keyed` UniFFI constructors (F-25). A free function because UniFFI
@@ -491,7 +496,12 @@ impl HopNode {
     /// `sqlcipher` cargo feature; without it the key is accepted but the db stays plain. An empty key
     /// behaves exactly like `open`.
     #[uniffi::constructor]
-    pub fn open_keyed(db_path: String, secret: Vec<u8>, app_secret: Vec<u8>, key: Vec<u8>) -> Arc<Self> {
+    pub fn open_keyed(
+        db_path: String,
+        secret: Vec<u8>,
+        app_secret: Vec<u8>,
+        key: Vec<u8>,
+    ) -> Arc<Self> {
         open_node_inner(&db_path, &secret, &app_secret, &key)
     }
 
@@ -526,18 +536,31 @@ impl HopNode {
 
     /// A bearer connection came up; `initiator` = we dialed it (BLE central).
     pub fn connected(&self, link: u64, initiator: bool) {
-        let role = if initiator { Role::Initiator } else { Role::Responder };
-        self.inner.lock().unwrap().handle(BearerEvent::Connected(link, role));
+        let role = if initiator {
+            Role::Initiator
+        } else {
+            Role::Responder
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .handle(BearerEvent::Connected(link, role));
     }
 
     /// A bearer connection dropped.
     pub fn disconnected(&self, link: u64) {
-        self.inner.lock().unwrap().handle(BearerEvent::Disconnected(link));
+        self.inner
+            .lock()
+            .unwrap()
+            .handle(BearerEvent::Disconnected(link));
     }
 
     /// Bytes arrived on a connection.
     pub fn received(&self, link: u64, bytes: Vec<u8>) {
-        self.inner.lock().unwrap().handle(BearerEvent::Data(link, bytes));
+        self.inner
+            .lock()
+            .unwrap()
+            .handle(BearerEvent::Data(link, bytes));
     }
 
     /// Bytes the host must send over the bearer (then clears them).
@@ -633,7 +656,12 @@ impl HopNode {
             .browse(&service, tag.as_deref())
             .into_iter()
             .filter_map(|a| match a.body.kind {
-                AdvertKind::Service { service, title, summary, tags } => Some(ServiceHit {
+                AdvertKind::Service {
+                    service,
+                    title,
+                    summary,
+                    tags,
+                } => Some(ServiceHit {
                     publisher: a.body.publisher.to_vec(),
                     service,
                     title,
@@ -649,15 +677,23 @@ impl HopNode {
 
     /// Delivery status of a message we sent, by its bundle id.
     pub fn message_status(&self, id: Vec<u8>) -> MessageStatus {
-        let blank = MessageStatus { relayed: 0, delivered: false, delivery_hops: 0, delivery_ms: 0 };
+        let blank = MessageStatus {
+            relayed: 0,
+            delivered: false,
+            delivery_hops: 0,
+            delivery_ms: 0,
+        };
         let id = match to32(&id) {
             Ok(i) => i,
             Err(_) => return blank,
         };
         match self.inner.lock().unwrap().message_status(&id) {
-            Some((relayed, delivered, delivery_hops, delivery_ms)) => {
-                MessageStatus { relayed, delivered, delivery_hops, delivery_ms }
-            }
+            Some((relayed, delivered, delivery_hops, delivery_ms)) => MessageStatus {
+                relayed,
+                delivered,
+                delivery_hops,
+                delivery_ms,
+            },
             None => blank,
         }
     }
@@ -696,7 +732,13 @@ impl HopNode {
 
     /// Addresses of currently-connected, authenticated peers.
     pub fn peers(&self) -> Vec<Vec<u8>> {
-        self.inner.lock().unwrap().peers().iter().map(|a| a.to_vec()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .peers()
+            .iter()
+            .map(|a| a.to_vec())
+            .collect()
     }
 
     /// Whether this node has learned a live route toward `address` from observed
@@ -716,7 +758,10 @@ impl HopNode {
             .unwrap()
             .peer_links()
             .into_iter()
-            .map(|(address, link)| PeerLink { address: address.to_vec(), link })
+            .map(|(address, link)| PeerLink {
+                address: address.to_vec(),
+                link,
+            })
             .collect()
     }
 
@@ -829,7 +874,9 @@ impl HopNode {
     /// Resolve `domain` to its hops endpoint address (DESIGN.md §30). See [`HnsLookupResult`].
     pub fn resolve_hns(&self, domain: String) -> HnsLookupResult {
         match self.inner.lock().unwrap().resolve_hns(&domain) {
-            HnsLookup::Cached(Some(addr)) => HnsLookupResult::Cached { address: addr.to_vec() },
+            HnsLookup::Cached(Some(addr)) => HnsLookupResult::Cached {
+                address: addr.to_vec(),
+            },
             HnsLookup::Cached(None) => HnsLookupResult::Cached { address: vec![] },
             HnsLookup::Pending => HnsLookupResult::Pending,
             HnsLookup::NeedsResolver => HnsLookupResult::NeedsResolver,
@@ -865,7 +912,10 @@ impl HopNode {
     /// Feed back the raw DoH response bodies for a domain's chain. Core validates the DNSSEC
     /// chain to the root anchors and caches the address only if it verifies (DESIGN.md §30).
     pub fn provide_dns_proof(&self, domain: String, bodies: Vec<String>) {
-        self.inner.lock().unwrap().provide_dns_proof(&domain, bodies);
+        self.inner
+            .lock()
+            .unwrap()
+            .provide_dns_proof(&domain, bodies);
     }
 
     /// A snapshot of the live HNS cache (for the debug view): each cached domain, its address
@@ -913,30 +963,55 @@ impl HopNode {
         self.inner
             .lock()
             .unwrap()
-            .register_service(&path, kind_to_core(&kind), access_to_core(&access), vis_to_core(&visibility))
+            .register_service(
+                &path,
+                kind_to_core(&kind),
+                access_to_core(&access),
+                vis_to_core(&visibility),
+            )
             .map(|pk| pk.to_vec())
             .unwrap_or_default()
     }
 
     /// Host → destination: invite an address to a topic we host (Invite mode). Returns the
     /// invite bundle id.
-    pub fn hps_invite(&self, path: String, dest: Vec<u8>) -> std::result::Result<Vec<u8>, FfiError> {
+    pub fn hps_invite(
+        &self,
+        path: String,
+        dest: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, FfiError> {
         let dest = to32(&dest)?;
-        let id = self.inner.lock().unwrap().hps_invite(&path, dest)
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .hps_invite(&path, dest)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
     }
 
     /// Member → host: accept an invite we received; the host then seals us the keys.
-    pub fn hps_accept_invite(&self, host: Vec<u8>, path: String) -> std::result::Result<Vec<u8>, FfiError> {
+    pub fn hps_accept_invite(
+        &self,
+        host: Vec<u8>,
+        path: String,
+    ) -> std::result::Result<Vec<u8>, FfiError> {
         let host = to32(&host)?;
-        let id = self.inner.lock().unwrap().hps_accept_invite(host, &path)
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .hps_accept_invite(host, &path)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
     }
 
     /// Decline a received invite — drops it from durable storage so it won't reappear on restart.
-    pub fn hps_decline_invite(&self, host: Vec<u8>, path: String) -> std::result::Result<(), FfiError> {
+    pub fn hps_decline_invite(
+        &self,
+        host: Vec<u8>,
+        path: String,
+    ) -> std::result::Result<(), FfiError> {
         let host = to32(&host)?;
         self.inner.lock().unwrap().hps_decline_invite(host, &path);
         Ok(())
@@ -944,27 +1019,53 @@ impl HopNode {
 
     /// Drain invites we've received (DESIGN.md §32 Invite mode), clearing them.
     pub fn take_hps_invites(&self) -> Vec<HpsInvite> {
-        self.inner.lock().unwrap().take_hps_invites().into_iter()
-            .map(|i| HpsInvite { path: i.path, host: i.host.to_vec(), kind: kind_from_core(i.kind) })
+        self.inner
+            .lock()
+            .unwrap()
+            .take_hps_invites()
+            .into_iter()
+            .map(|i| HpsInvite {
+                path: i.path,
+                host: i.host.to_vec(),
+                kind: kind_from_core(i.kind),
+            })
             .collect()
     }
 
     /// Member → host: leave a topic (stop being re-keyed). Returns the leave bundle id, if any.
     pub fn hps_leave(&self, path: String) -> std::result::Result<Vec<u8>, FfiError> {
-        let id = self.inner.lock().unwrap().hps_leave(&path)
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .hps_leave(&path)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.map(|b| b.to_vec()).unwrap_or_default())
     }
 
     /// Host: pending join requests for a RequestToJoin topic (each is a requester address).
     pub fn hps_pending(&self, path: String) -> Vec<Vec<u8>> {
-        self.inner.lock().unwrap().hps_pending(&path).into_iter().map(|a| a.to_vec()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .hps_pending(&path)
+            .into_iter()
+            .map(|a| a.to_vec())
+            .collect()
     }
 
     /// Host: approve a pending requester, sealing them the keys. Returns the keys bundle id.
-    pub fn hps_approve(&self, path: String, requester: Vec<u8>) -> std::result::Result<Vec<u8>, FfiError> {
+    pub fn hps_approve(
+        &self,
+        path: String,
+        requester: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, FfiError> {
         let requester = to32(&requester)?;
-        let id = self.inner.lock().unwrap().hps_approve(&path, requester)
+        let id = self
+            .inner
+            .lock()
+            .unwrap()
+            .hps_approve(&path, requester)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
     }
@@ -989,8 +1090,16 @@ impl HopNode {
         for r in &remove {
             removed.push(to32(r)?);
         }
-        let np = if new_path.trim().is_empty() { None } else { Some(new_path.as_str()) };
-        let ids = self.inner.lock().unwrap().hps_rekey(&path, np, &removed)
+        let np = if new_path.trim().is_empty() {
+            None
+        } else {
+            Some(new_path.as_str())
+        };
+        let ids = self
+            .inner
+            .lock()
+            .unwrap()
+            .hps_rekey(&path, np, &removed)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(ids.into_iter().map(|b| b.to_vec()).collect())
     }
@@ -1002,13 +1111,23 @@ impl HopNode {
 
     /// Host: the retained-member set (addresses) for a topic.
     pub fn hps_members(&self, path: String) -> Vec<Vec<u8>> {
-        self.inner.lock().unwrap().hps_members(&path).into_iter().map(|a| a.to_vec()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .hps_members(&path)
+            .into_iter()
+            .map(|a| a.to_vec())
+            .collect()
     }
 
     /// Topics this node hosts or follows — the app calls this at startup to rebuild its channel
     /// list, since the node persists topics but the app's in-memory list doesn't.
     pub fn hps_my_topics(&self) -> Vec<HpsMyTopic> {
-        self.inner.lock().unwrap().hps_my_topics().into_iter()
+        self.inner
+            .lock()
+            .unwrap()
+            .hps_my_topics()
+            .into_iter()
             .map(|t| HpsMyTopic {
                 host: t.host.to_vec(),
                 path: t.path,
@@ -1021,7 +1140,11 @@ impl HopNode {
 
     /// Same-app discoverable topics visible on the mesh (decrypted descriptors + host address).
     pub fn browse_discoverable(&self) -> Vec<HpsTopicInfo> {
-        self.inner.lock().unwrap().browse_discoverable(None).into_iter()
+        self.inner
+            .lock()
+            .unwrap()
+            .browse_discoverable(None)
+            .into_iter()
             .map(|(host, m)| HpsTopicInfo {
                 host: host.to_vec(),
                 path: m.path,
@@ -1074,7 +1197,11 @@ impl HopNode {
             .unwrap()
             .take_hps_messages()
             .into_iter()
-            .map(|m| HpsMessage { path: m.path, sender: m.sender.to_vec(), body: m.body })
+            .map(|m| HpsMessage {
+                path: m.path,
+                sender: m.sender.to_vec(),
+                body: m.body,
+            })
             .collect()
     }
 
@@ -1149,7 +1276,12 @@ impl HopNode {
 
     /// This node's display name (empty string if unset).
     pub fn name(&self) -> String {
-        self.inner.lock().unwrap().name().unwrap_or_default().to_string()
+        self.inner
+            .lock()
+            .unwrap()
+            .name()
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// Call a service/command on `dst` (DESIGN.md §29). For the built-in identity
@@ -1257,10 +1389,18 @@ mod tests {
         assert_eq!(sec.len(), 32, "secret is the 32-byte Ed25519 seed");
         // Restoring from the saved secret MUST reproduce the same address.
         let b = HopNode::with_secret(sec.clone());
-        assert_eq!(b.address(), addr, "restored identity keeps the same address");
+        assert_eq!(
+            b.address(),
+            addr,
+            "restored identity keeps the same address"
+        );
         // And the persistent constructor must do the same.
         let c = HopNode::open(":memory:".into(), sec, Vec::new());
-        assert_eq!(c.address(), addr, "persistent restore keeps the same address");
+        assert_eq!(
+            c.address(),
+            addr,
+            "persistent restore keeps the same address"
+        );
     }
 
     #[test]
@@ -1277,8 +1417,13 @@ mod tests {
         b.connected(1, false);
         pump(&a, &b);
 
-        a.send_message(b.address(), "text/plain".into(), b"hi over ffi".to_vec(), false)
-            .unwrap();
+        a.send_message(
+            b.address(),
+            "text/plain".into(),
+            b"hi over ffi".to_vec(),
+            false,
+        )
+        .unwrap();
         pump(&a, &b);
         pump(&a, &b);
 

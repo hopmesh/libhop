@@ -128,7 +128,10 @@ pub unsafe extern "C" fn hop_node_new() -> *const HopNode {
 /// Open a node from a saved 32-byte identity `secret` with ephemeral (in-memory) storage. Pass
 /// NULL/0 for a fresh identity. Free with `hop_node_free`.
 #[no_mangle]
-pub unsafe extern "C" fn hop_node_with_secret(secret: *const u8, secret_len: usize) -> *const HopNode {
+pub unsafe extern "C" fn hop_node_with_secret(
+    secret: *const u8,
+    secret_len: usize,
+) -> *const HopNode {
     let secret = slice(secret, secret_len).to_vec();
     catch_ctor(|| Arc::into_raw(HopNode::with_secret(secret)))
 }
@@ -217,7 +220,12 @@ pub unsafe extern "C" fn hop_link_up(node: *const HopNode, link: u64, role: HopL
 
 /// One frame of opaque bytes arrived on `link`.
 #[no_mangle]
-pub unsafe extern "C" fn hop_bytes_received(node: *const HopNode, link: u64, data: *const u8, len: usize) {
+pub unsafe extern "C" fn hop_bytes_received(
+    node: *const HopNode,
+    link: u64,
+    data: *const u8,
+    len: usize,
+) {
     if let Some(node) = node_ref(node) {
         node.received(link, slice(data, len).to_vec());
     }
@@ -293,7 +301,15 @@ pub unsafe extern "C" fn hop_poll_inbox(
     };
     for m in node.take_inbox() {
         let ct = std::ffi::CString::new(m.content_type).unwrap_or_default();
-        sink(ctx, m.from.as_ptr(), ct.as_ptr(), m.body.as_ptr(), m.body.len(), m.hops, m.created_at);
+        sink(
+            ctx,
+            m.from.as_ptr(),
+            ct.as_ptr(),
+            m.body.as_ptr(),
+            m.body.len(),
+            m.hops,
+            m.created_at,
+        );
     }
 }
 
@@ -320,7 +336,12 @@ pub unsafe extern "C" fn hop_send_to(
     if dst.is_null() {
         return false;
     }
-    match node.send_to(slice(dst, 32).to_vec(), ct.to_string(), slice(body, body_len).to_vec(), request_ack) {
+    match node.send_to(
+        slice(dst, 32).to_vec(),
+        ct.to_string(),
+        slice(body, body_len).to_vec(),
+        request_ack,
+    ) {
         Ok(id) => {
             if !out_id.is_null() {
                 std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
@@ -468,7 +489,15 @@ pub unsafe extern "C" fn hop_poll_service_requests(
     for r in node.take_service_requests() {
         let svc = std::ffi::CString::new(r.service).unwrap_or_default();
         let mth = std::ffi::CString::new(r.method).unwrap_or_default();
-        sink(ctx, r.from.as_ptr(), r.request_id.as_ptr(), svc.as_ptr(), mth.as_ptr(), r.args.as_ptr(), r.args.len());
+        sink(
+            ctx,
+            r.from.as_ptr(),
+            r.request_id.as_ptr(),
+            svc.as_ptr(),
+            mth.as_ptr(),
+            r.args.as_ptr(),
+            r.args.len(),
+        );
     }
 }
 
@@ -478,7 +507,14 @@ pub unsafe extern "C" fn hop_poll_service_requests(
 pub unsafe extern "C" fn hop_poll_service_responses(
     node: *const HopNode,
     sink: Option<
-        extern "C" fn(ctx: *mut c_void, from: *const u8, for_request_id: *const u8, status: u16, body: *const u8, body_len: usize),
+        extern "C" fn(
+            ctx: *mut c_void,
+            from: *const u8,
+            for_request_id: *const u8,
+            status: u16,
+            body: *const u8,
+            body_len: usize,
+        ),
     >,
     ctx: *mut c_void,
 ) {
@@ -486,7 +522,14 @@ pub unsafe extern "C" fn hop_poll_service_responses(
         return;
     };
     for r in node.take_service_responses() {
-        sink(ctx, r.from.as_ptr(), r.for_request_id.as_ptr(), r.status, r.body.as_ptr(), r.body.len());
+        sink(
+            ctx,
+            r.from.as_ptr(),
+            r.for_request_id.as_ptr(),
+            r.status,
+            r.body.as_ptr(),
+            r.body.len(),
+        );
     }
 }
 
@@ -495,7 +538,11 @@ pub unsafe extern "C" fn hop_poll_service_responses(
 /// Encode a 32-byte `addr` as base58 into the C buffer `out` (`out_cap` bytes incl. NUL). Returns
 /// the string length (excluding NUL), or 0 on NULL / insufficient capacity.
 #[no_mangle]
-pub unsafe extern "C" fn hop_address_to_base58(addr: *const u8, out: *mut c_char, out_cap: usize) -> usize {
+pub unsafe extern "C" fn hop_address_to_base58(
+    addr: *const u8,
+    out: *mut c_char,
+    out_cap: usize,
+) -> usize {
     if addr.is_null() || out.is_null() || out_cap == 0 {
         return 0;
     }
@@ -551,7 +598,12 @@ pub unsafe extern "C" fn hop_send_message(
     if dst.is_null() {
         return false;
     }
-    match node.send_message(slice(dst, 32).to_vec(), ct.to_string(), slice(body, body_len).to_vec(), request_ack) {
+    match node.send_message(
+        slice(dst, 32).to_vec(),
+        ct.to_string(),
+        slice(body, body_len).to_vec(),
+        request_ack,
+    ) {
         Ok(id) => {
             if !out_id.is_null() {
                 std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
