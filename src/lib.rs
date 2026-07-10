@@ -15,13 +15,33 @@ use std::sync::{Arc, Mutex};
 
 use hop_core::prelude::*;
 
+// core-ffi-sdk-r2-02: the SQLite store is compiled iff the `full` feature is on (that is the feature
+// that actually pulls in `dep:hop-store-sqlite`). The old gate keyed the alias off `not(minimal)`,
+// which is TRUE for a bare `--no-default-features` build where `full` is ALSO off, so it referenced a
+// crate that Cargo never linked and failed to compile in isolation. `full` is the single real axis;
+// `minimal` is a coherence marker (see the compile guard below), so gating on `full`/`not(full)` makes
+// the two builds exactly exhaustive.
 /// The store backing a [`HopNode`] (core-ffi-03). The full build persists to SQLite; the constrained
-/// `minimal` build swaps in hop-core's in-memory store, so an ESP32 `libhop.a` carries no SQLite (and
+/// embedded build swaps in hop-core's in-memory store, so an ESP32 `libhop.a` carries no SQLite (and
 /// no UniFFI). Every `HopNode` method is written against this alias, so the two builds share one body.
-#[cfg(not(feature = "minimal"))]
+#[cfg(feature = "full")]
 type HopStore = hop_store_sqlite::SqliteStore;
-#[cfg(feature = "minimal")]
+#[cfg(not(feature = "full"))]
 type HopStore = hop_core::store::MemoryStore;
+
+// core-ffi-sdk-r2-02: make the two build axes coherent. `full` (the axis that actually pulls in
+// `dep:hop-store-sqlite` + `dep:uniffi`) selects the full surface; its absence selects the embedded
+// surface (in-memory store, C ABI only). So a bare `--no-default-features` build is a VALID embedded
+// build that compiles, `--features minimal` is the same thing named explicitly, and `bundled`
+// (default) / `sqlcipher` give the full surface. `full` and `minimal` are contradictory intents
+// (SQLite+UniFFI vs. drop-both), so reject that combination loudly instead of silently ignoring
+// `minimal`.
+#[cfg(all(feature = "full", feature = "minimal"))]
+compile_error!(
+    "hop: `full` and `minimal` are contradictory build surfaces; enable at most one. `minimal` drops \
+     SQLite + UniFFI for a constrained target; `full` (via `bundled`/`sqlcipher`) keeps them. A bare \
+     `--no-default-features` build (neither) is the embedded surface."
+);
 
 /// libhop — the stable C ABI (cbindgen → `include/hop.h`): the universal client SDK + bearer seam,
 /// for every non-UniFFI target (C/C++, ESP32, …). Wraps the SAME `HopNode` as the UniFFI surface.
@@ -414,9 +434,9 @@ pub struct HopNode {
 /// corrupt/read-only db becomes a clean fresh start rather than permanent per-launch amnesia.
 /// Returns `(store, persistent)`; only falls back to in-memory if even a fresh file won't open.
 /// See F-26 — the old code did `open(path).or_else(in_memory)`, so a bad path silently ran
-/// ephemeral forever with no signal to the host. (core-ffi-03: SQLite-only, so the `minimal`
-/// embedded build compiles it out entirely.)
-#[cfg(not(feature = "minimal"))]
+/// ephemeral forever with no signal to the host. (core-ffi-03: SQLite-only, so it is compiled only
+/// for the `full` build; the embedded build has no SQLite.)
+#[cfg(feature = "full")]
 fn open_store_persistent(db_path: &str, key: &[u8]) -> (HopStore, bool) {
     use hop_store_sqlite::SqliteStore;
     // F-25: an empty key opens plain; a 32-byte key opens SQLCipher-encrypted (under the store's
@@ -481,7 +501,7 @@ fn open_store_persistent(db_path: &str, key: &[u8]) -> (HopStore, bool) {
 /// Shared body of the `open` / `open_keyed` UniFFI constructors (F-25). A free function because UniFFI
 /// doesn't allow a private associated fn inside an exported impl. (core-ffi-03: SQLite-backed, so it is
 /// compiled only for the full build.)
-#[cfg(not(feature = "minimal"))]
+#[cfg(feature = "full")]
 fn open_node_inner(db_path: &str, secret: &[u8], app_secret: &[u8], key: &[u8]) -> Arc<HopNode> {
     let (store, persistent) = open_store_persistent(db_path, key);
     let mut node = Node::with_store(identity_from(secret), store);
@@ -518,14 +538,14 @@ impl HopNode {
     }
 }
 
-/// A fresh EPHEMERAL store (core-ffi-03). The full build uses an in-memory SQLite; the `minimal`
-/// embedded build uses hop-core's in-memory store, so no SQLite is linked at all.
+/// A fresh EPHEMERAL store (core-ffi-03). The full build uses an in-memory SQLite; the embedded build
+/// uses hop-core's in-memory store, so no SQLite is linked at all.
 fn fresh_ephemeral_store() -> HopStore {
-    #[cfg(not(feature = "minimal"))]
+    #[cfg(feature = "full")]
     {
         hop_store_sqlite::SqliteStore::open_in_memory().expect("in-memory sqlite")
     }
-    #[cfg(feature = "minimal")]
+    #[cfg(not(feature = "full"))]
     {
         hop_core::store::MemoryStore::new()
     }
@@ -587,11 +607,11 @@ impl HopNode {
         app_secret: Vec<u8>,
         key: Vec<u8>,
     ) -> Arc<Self> {
-        #[cfg(not(feature = "minimal"))]
+        #[cfg(feature = "full")]
         {
             open_node_inner(&db_path, &secret, &app_secret, &key)
         }
-        #[cfg(feature = "minimal")]
+        #[cfg(not(feature = "full"))]
         {
             let _ = (&db_path, &key); // no persistence on a constrained target — run ephemeral
             let mut node = Node::with_store(identity_from(&secret), fresh_ephemeral_store());

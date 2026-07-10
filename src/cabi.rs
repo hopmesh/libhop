@@ -177,12 +177,14 @@ pub unsafe extern "C" fn hop_node_free(node: *const HopNode) {
 /// Write this node's 32-byte address into `out` (must have room for 32 bytes). False on NULL.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_address(node: *const HopNode, out: *mut u8) -> bool {
-    let (Some(node), false) = (node_ref(node), out.is_null()) else {
-        return false;
-    };
-    let addr = node.address();
-    std::ptr::copy_nonoverlapping(addr.as_ptr(), out, addr.len().min(32));
-    true
+    catch(false, || {
+        let (Some(node), false) = (node_ref(node), out.is_null()) else {
+            return false;
+        };
+        let addr = node.address();
+        std::ptr::copy_nonoverlapping(addr.as_ptr(), out, addr.len().min(32));
+        true
+    })
 }
 
 /// Write this node's 32-byte identity secret into `out` (room for 32 bytes) so the host can persist
@@ -190,21 +192,25 @@ pub unsafe extern "C" fn hop_node_address(node: *const HopNode, out: *mut u8) ->
 /// Returns the number of bytes written (32), or 0 on NULL.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_secret(node: *const HopNode, out: *mut u8) -> usize {
-    let (Some(node), false) = (node_ref(node), out.is_null()) else {
-        return 0;
-    };
-    let s = node.secret();
-    let n = s.len().min(32);
-    std::ptr::copy_nonoverlapping(s.as_ptr(), out, n);
-    n
+    catch(0, || {
+        let (Some(node), false) = (node_ref(node), out.is_null()) else {
+            return 0;
+        };
+        let s = node.secret();
+        let n = s.len().min(32);
+        std::ptr::copy_nonoverlapping(s.as_ptr(), out, n);
+        n
+    })
 }
 
 /// Set the display name this node reports via presence / `hop.identify` (DESIGN.md §29).
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_set_name(node: *const HopNode, name: *const c_char) {
-    if let (Some(node), Some(name)) = (node_ref(node), cstr(name)) {
-        node.set_name(name.to_string());
-    }
+    catch((), || {
+        if let (Some(node), Some(name)) = (node_ref(node), cstr(name)) {
+            node.set_name(name.to_string());
+        }
+    })
 }
 
 // ---- clock ------------------------------------------------------------------------------------
@@ -290,9 +296,11 @@ pub unsafe extern "C" fn hop_drain_outgoing(
 /// Subscribe the directory to a service `topic` (UTF-8 C string).
 #[no_mangle]
 pub unsafe extern "C" fn hop_subscribe(node: *const HopNode, topic: *const c_char) {
-    if let (Some(node), Some(topic)) = (node_ref(node), cstr(topic)) {
-        node.subscribe(topic.to_string());
-    }
+    catch((), || {
+        if let (Some(node), Some(topic)) = (node_ref(node), cstr(topic)) {
+            node.subscribe(topic.to_string());
+        }
+    })
 }
 
 /// Publish this node's prekey advert (DESIGN.md §25) so peers can seal forward-secret messages to
@@ -300,7 +308,10 @@ pub unsafe extern "C" fn hop_subscribe(node: *const HopNode, topic: *const c_cha
 /// real clock, else the advert is judged expired). Returns true on success.
 #[no_mangle]
 pub unsafe extern "C" fn hop_publish_prekey(node: *const HopNode) -> bool {
-    matches!(node_ref(node), Some(node) if node.publish_prekey().is_ok())
+    catch(
+        false,
+        || matches!(node_ref(node), Some(node) if node.publish_prekey().is_ok()),
+    )
 }
 
 /// Drain newly-received messages (poll model). Invokes
@@ -355,29 +366,31 @@ pub unsafe extern "C" fn hop_send_to(
     request_ack: bool,
     out_id: *mut u8,
 ) -> bool {
-    let Some(node) = node_ref(node) else {
-        return false;
-    };
-    let Some(ct) = cstr(content_type) else {
-        return false;
-    };
-    if dst.is_null() {
-        return false;
-    }
-    match node.send_to(
-        slice(dst, 32).to_vec(),
-        ct.to_string(),
-        slice(body, body_len).to_vec(),
-        request_ack,
-    ) {
-        Ok(id) => {
-            if !out_id.is_null() {
-                std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
-            }
-            true
+    catch(false, || {
+        let Some(node) = node_ref(node) else {
+            return false;
+        };
+        let Some(ct) = cstr(content_type) else {
+            return false;
+        };
+        if dst.is_null() {
+            return false;
         }
-        Err(_) => false,
-    }
+        match node.send_to(
+            slice(dst, 32).to_vec(),
+            ct.to_string(),
+            slice(body, body_len).to_vec(),
+            request_ack,
+        ) {
+            Ok(id) => {
+                if !out_id.is_null() {
+                    std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// Delivery status of a message we sent, by its 32-byte bundle `id`. Writes each field to its
@@ -393,33 +406,38 @@ pub unsafe extern "C" fn hop_message_status(
     out_hops: *mut u8,
     out_ms: *mut u32,
 ) -> bool {
-    let Some(node) = node_ref(node) else {
-        return false;
-    };
-    if id.is_null() {
-        return false;
-    }
-    let st = node.message_status(slice(id, 32).to_vec());
-    if !out_relayed.is_null() {
-        *out_relayed = st.relayed;
-    }
-    if !out_delivered.is_null() {
-        *out_delivered = st.delivered;
-    }
-    if !out_hops.is_null() {
-        *out_hops = st.delivery_hops;
-    }
-    if !out_ms.is_null() {
-        *out_ms = st.delivery_ms;
-    }
-    true
+    catch(false, || {
+        let Some(node) = node_ref(node) else {
+            return false;
+        };
+        if id.is_null() {
+            return false;
+        }
+        let st = node.message_status(slice(id, 32).to_vec());
+        if !out_relayed.is_null() {
+            *out_relayed = st.relayed;
+        }
+        if !out_delivered.is_null() {
+            *out_delivered = st.delivered;
+        }
+        if !out_hops.is_null() {
+            *out_hops = st.delivery_hops;
+        }
+        if !out_ms.is_null() {
+            *out_ms = st.delivery_ms;
+        }
+        true
+    })
 }
 
 /// True iff messaging `addr` (32 bytes) is forward-secret — a ratchet session exists (DESIGN.md §25)
 /// rather than a static seal. Drives a lock indicator. False on NULL.
 #[no_mangle]
 pub unsafe extern "C" fn hop_is_secured(node: *const HopNode, addr: *const u8) -> bool {
-    matches!((node_ref(node), addr.is_null()), (Some(node), false) if node.is_secured(slice(addr, 32).to_vec()))
+    catch(
+        false,
+        || matches!((node_ref(node), addr.is_null()), (Some(node), false) if node.is_secured(slice(addr, 32).to_vec())),
+    )
 }
 
 // ---- hops:// request/response (a FULL round trip — HDP in BOTH directions) --------------------
@@ -442,29 +460,31 @@ pub unsafe extern "C" fn hop_send_service_request(
     args_len: usize,
     out_id: *mut u8,
 ) -> bool {
-    let Some(node) = node_ref(node) else {
-        return false;
-    };
-    let (Some(service), Some(method)) = (cstr(service), cstr(method)) else {
-        return false;
-    };
-    if dst.is_null() {
-        return false;
-    }
-    match node.send_service_request(
-        slice(dst, 32).to_vec(),
-        service.to_string(),
-        method.to_string(),
-        slice(args, args_len).to_vec(),
-    ) {
-        Ok(id) => {
-            if !out_id.is_null() {
-                std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
-            }
-            true
+    catch(false, || {
+        let Some(node) = node_ref(node) else {
+            return false;
+        };
+        let (Some(service), Some(method)) = (cstr(service), cstr(method)) else {
+            return false;
+        };
+        if dst.is_null() {
+            return false;
         }
-        Err(_) => false,
-    }
+        match node.send_service_request(
+            slice(dst, 32).to_vec(),
+            service.to_string(),
+            method.to_string(),
+            slice(args, args_len).to_vec(),
+        ) {
+            Ok(id) => {
+                if !out_id.is_null() {
+                    std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// Seal a hops:// response back to a request's caller (host side). `to` = the request's `from`;
@@ -478,19 +498,21 @@ pub unsafe extern "C" fn hop_send_service_response(
     body: *const u8,
     body_len: usize,
 ) -> bool {
-    let Some(node) = node_ref(node) else {
-        return false;
-    };
-    if to.is_null() || for_request_id.is_null() {
-        return false;
-    }
-    node.send_service_response(
-        slice(to, 32).to_vec(),
-        slice(for_request_id, 32).to_vec(),
-        status,
-        slice(body, body_len).to_vec(),
-    )
-    .is_ok()
+    catch(false, || {
+        let Some(node) = node_ref(node) else {
+            return false;
+        };
+        if to.is_null() || for_request_id.is_null() {
+            return false;
+        }
+        node.send_service_response(
+            slice(to, 32).to_vec(),
+            slice(for_request_id, 32).to_vec(),
+            status,
+            slice(body, body_len).to_vec(),
+        )
+        .is_ok()
+    })
 }
 
 /// Drain hops:// service requests addressed to this node (host side). Invokes
@@ -514,7 +536,10 @@ pub unsafe extern "C" fn hop_poll_service_requests(
     let (Some(node), Some(sink)) = (node_ref(node), sink) else {
         return;
     };
-    for r in node.take_service_requests() {
+    // core-ffi-01: the node-side drain may panic; contain it so it can't unwind across the ABI (the
+    // sink is a foreign fn: if IT panics that is the host's contract, outside our reach).
+    let requests = catch(Vec::new(), || node.take_service_requests());
+    for r in requests {
         let svc = std::ffi::CString::new(r.service).unwrap_or_default();
         let mth = std::ffi::CString::new(r.method).unwrap_or_default();
         sink(
@@ -549,7 +574,9 @@ pub unsafe extern "C" fn hop_poll_service_responses(
     let (Some(node), Some(sink)) = (node_ref(node), sink) else {
         return;
     };
-    for r in node.take_service_responses() {
+    // core-ffi-01: contain a panic in the node-side drain (see hop_poll_service_requests).
+    let responses = catch(Vec::new(), || node.take_service_responses());
+    for r in responses {
         sink(
             ctx,
             r.from.as_ptr(),
@@ -706,6 +733,98 @@ mod tests {
             hop_node_free(a);
             hop_node_free(b);
             hop_node_free(c);
+        }
+    }
+
+    // core-ffi-sdk-r2-01: panic-containment regression. Every hop_* body that calls into the node is
+    // wrapped in `catch(default, ...)` so a panic reached via crafted/hostile state degrades to a
+    // dropped op instead of unwinding across `extern "C"` (UB that aborts the whole host). These tests
+    // prove the mechanism the wraps depend on: a panicking closure yields the default and DOES NOT
+    // escape. Before the fix, hop_send_to / hop_message_status / hop_is_secured / the service
+    // send+poll fns / hop_publish_prekey / hop_subscribe / hop_node_address|secret|set_name had no
+    // such guard.
+
+    #[test]
+    fn catch_contains_an_unwinding_panic_and_returns_the_default() {
+        // The bool-returning fns (hop_send_to, hop_is_secured, hop_message_status, the service
+        // send fns, hop_publish_prekey, hop_node_address) default to false on panic.
+        let r = catch(false, || -> bool { panic!("boom from a core path") });
+        assert!(!r, "a panic yields the `false` default, not an unwind");
+
+        // The usize-returning hop_node_secret defaults to 0.
+        let n = catch(0usize, || -> usize { panic!("boom") });
+        assert_eq!(
+            n, 0,
+            "hop_node_secret's default on panic is 0 bytes written"
+        );
+
+        // The Vec-returning drains (hop_poll_service_requests/responses) default to empty.
+        let v = catch(Vec::<u8>::new(), || -> Vec<u8> { panic!("boom") });
+        assert!(
+            v.is_empty(),
+            "a drain panic yields an empty batch, not an unwind"
+        );
+
+        // The unit-returning fns (hop_subscribe, hop_node_set_name) simply swallow it.
+        catch((), || panic!("boom"));
+    }
+
+    #[test]
+    fn catch_is_transparent_when_no_panic_occurs() {
+        // Wrapping must NOT change the happy-path result: the fix is pure containment, no behavior
+        // change on the normal path (adversarial self-check: no black-holing of a good return).
+        assert!(catch(false, || true));
+        assert_eq!(catch(0usize, || 7usize), 7);
+        assert_eq!(catch(Vec::new(), || vec![1u8, 2, 3]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn wrapped_send_paths_run_clean_on_the_happy_path() {
+        // Drive the newly-wrapped fns through a live node to confirm the catch wrapper didn't alter
+        // their normal return (a `catch` mistakenly returning the default would surface here).
+        unsafe {
+            let node = hop_node_new();
+            assert!(
+                hop_publish_prekey(node),
+                "prekey publishes cleanly through the wrap"
+            );
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let dst = [9u8; 32];
+            let body = b"hi";
+            let mut out_id = [0u8; 32];
+            // Not connected to `dst`, so send_to must return false (its documented failure), NOT
+            // panic and NOT the catch-default masking a real send. Either way: no unwind.
+            let sent = hop_send_to(
+                node,
+                dst.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                false,
+                out_id.as_mut_ptr(),
+            );
+            assert!(!sent, "send_to to an unconnected peer is a clean false");
+
+            // is_secured on an unknown peer is a clean false.
+            assert!(!hop_is_secured(node, dst.as_ptr()));
+
+            // message_status for an unknown id returns true (fields written) with delivered=false.
+            let mut relayed = 1u32;
+            let mut delivered = true;
+            let ok = hop_message_status(
+                node,
+                out_id.as_ptr(),
+                &mut relayed,
+                &mut delivered,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(ok);
+            assert!(!delivered, "an unknown bundle id is not delivered");
+            assert_eq!(relayed, 0);
+
+            hop_node_free(node);
         }
     }
 }

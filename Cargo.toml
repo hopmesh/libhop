@@ -49,8 +49,12 @@ sqlcipher = ["full", "hop-store-sqlite/sqlcipher"]
 # target (mobile, host tools, tests) uses this. `minimal` is its opposite (see below).
 full = ["dep:uniffi", "dep:hop-store-sqlite"]
 # core-ffi-03: a CONSTRAINED-TARGET build. Drops UniFFI scaffolding AND the SQLite store, backing the
-# node with hop-core's in-memory store so `libhop.a` is a pure `no_std`-adjacent, allocator-only C ABI
-# suitable for an ESP32 (Xtensa/RISC-V) where bundled SQLite + UniFFI won't fit. Build it with:
-#   cargo build -p hop --no-default-features --features minimal --target riscv32imc-unknown-none-elf
-# (host smoke-check: `cargo build -p hop --no-default-features --features minimal`).
+# node with hop-core's in-memory store so `libhop.a` is a slim, allocator-only C ABI suitable for an
+# ESP32 (Xtensa/RISC-V) where bundled SQLite + UniFFI won't fit. It still uses `std` (HashMap/Mutex/Vec),
+# so it targets the ESP-IDF **std tier** (`*-esp-espidf`, where ESP-IDF supplies a newlib-backed std),
+# NOT the bare `-none-elf` no_std tier (core-ffi-sdk-r2-04, matching README.md + build-libhop-esp.sh).
+# Build it with:
+#   cargo build -p hop --no-default-features --features minimal --target riscv32imc-esp-espidf
+# (see apps/esp32/hop-sensor/build-libhop-esp.sh for the authoritative -Zbuild-std invocation).
+# Host smoke-check (no cross-toolchain needed): cargo build -p hop --no-default-features --features minimal
 minimal = []
