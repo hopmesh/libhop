@@ -14,12 +14,22 @@
 use std::sync::{Arc, Mutex};
 
 use hop_core::prelude::*;
-use hop_store_sqlite::SqliteStore;
+
+/// The store backing a [`HopNode`] (core-ffi-03). The full build persists to SQLite; the constrained
+/// `minimal` build swaps in hop-core's in-memory store, so an ESP32 `libhop.a` carries no SQLite (and
+/// no UniFFI). Every `HopNode` method is written against this alias, so the two builds share one body.
+#[cfg(not(feature = "minimal"))]
+type HopStore = hop_store_sqlite::SqliteStore;
+#[cfg(feature = "minimal")]
+type HopStore = hop_core::store::MemoryStore;
 
 /// libhop — the stable C ABI (cbindgen → `include/hop.h`): the universal client SDK + bearer seam,
 /// for every non-UniFFI target (C/C++, ESP32, …). Wraps the SAME `HopNode` as the UniFFI surface.
 pub mod cabi;
 
+// core-ffi-03: UniFFI scaffolding is compiled only for the full build. The `minimal` build exposes
+// ONLY the C ABI (`cabi.rs`), which is all a constrained/embedded client binds.
+#[cfg(feature = "full")]
 uniffi::setup_scaffolding!();
 
 /// Build an identity from saved secret bytes, or a fresh one if absent/invalid.
@@ -31,13 +41,13 @@ fn identity_from(secret: &[u8]) -> Identity {
 }
 
 /// Render an address as base58 (compact, copy/paste/QR-friendly).
-#[uniffi::export]
+#[cfg_attr(feature = "full", uniffi::export)]
 pub fn address_base58(address: Vec<u8>) -> String {
     bs58::encode(address).into_string()
 }
 
 /// Decode a base58 address back to bytes (empty on invalid input).
-#[uniffi::export]
+#[cfg_attr(feature = "full", uniffi::export)]
 pub fn address_from_base58(text: String) -> Vec<u8> {
     bs58::decode(text).into_vec().unwrap_or_default()
 }
@@ -49,7 +59,7 @@ fn hex8(b: &[u8; 8]) -> String {
 
 /// The 8-byte short form of a full address — matches what trace hops carry, so the app
 /// can index its known addresses by this and resolve trace hops to display names (§27).
-#[uniffi::export]
+#[cfg_attr(feature = "full", uniffi::export)]
 pub fn short_address(address: Vec<u8>) -> Vec<u8> {
     match to32(&address) {
         Ok(a) => short_addr(&a).to_vec(),
@@ -59,14 +69,14 @@ pub fn short_address(address: Vec<u8>) -> Vec<u8> {
 
 /// The built-in identity service name (`hop.identify`) — call it on a peer to learn its
 /// display name + kind (DESIGN.md §29).
-#[uniffi::export]
+#[cfg_attr(feature = "full", uniffi::export)]
 pub fn service_identify() -> String {
     SERVICE_IDENTIFY.to_string()
 }
 
 /// Decode a `hop.identify` response body into an [`IdentityInfo`]. Returns `None` if the
 /// bytes aren't a valid identity record (e.g. the response was for a different service).
-#[uniffi::export]
+#[cfg_attr(feature = "full", uniffi::export)]
 pub fn decode_identity(body: Vec<u8>) -> Option<IdentityInfo> {
     let rec: IdentityRecord = postcard::from_bytes(&body).ok()?;
     Some(IdentityInfo {
@@ -96,14 +106,14 @@ fn label_app(app: &ShortApp) -> String {
 }
 
 /// Opaque bytes to ship over the bearer on a given connection.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct OutPacket {
     pub link: u64,
     pub bytes: Vec<u8>,
 }
 
 /// A decrypted message delivered to this node.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct InboxMessage {
     /// Sender's hop address (Ed25519 public key).
     pub from: Vec<u8>,
@@ -122,7 +132,7 @@ pub struct InboxMessage {
 }
 
 /// One forwarding hop in a message's provenance trace (DESIGN.md §27).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct TraceHopInfo {
     /// The forwarder's 8-byte short address. Compare to `short_address(full)` of a known
     /// peer/relay/contact to resolve it to a display name; show hex if unknown.
@@ -132,7 +142,7 @@ pub struct TraceHopInfo {
 }
 
 /// A node's identity, decoded from a `hop.identify` response (DESIGN.md §29).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct IdentityInfo {
     /// The node's full hop address.
     pub address: Vec<u8>,
@@ -144,7 +154,7 @@ pub struct IdentityInfo {
 }
 
 /// A custom (non-`hop.`) service request addressed to this node for the app to fulfill.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct ServiceReq {
     pub from: Vec<u8>,
     /// Request id — pass back to `send_service_response` as `for_request_id`.
@@ -155,7 +165,7 @@ pub struct ServiceReq {
 }
 
 /// A service response sealed back to this node as a caller.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct ServiceResp {
     pub from: Vec<u8>,
     pub for_request_id: Vec<u8>,
@@ -166,7 +176,7 @@ pub struct ServiceResp {
 /// A service advert discovered via gossip (direct or relayed). The `publisher` is
 /// the address to message — its sealing key is derived from it. Apps build presence
 /// and contacts on this (e.g. a "presence" service whose `title` is a display name).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct ServiceHit {
     /// Publisher's hop address (Ed25519 public key) — message this to reach them.
     pub publisher: Vec<u8>,
@@ -182,7 +192,7 @@ pub struct ServiceHit {
 }
 
 /// An egress HTTP request a gateway should fulfill (Use Case A, §9).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HttpReq {
     /// Requester's address (seal the response back to this).
     pub from: Vec<u8>,
@@ -197,7 +207,7 @@ pub struct HttpReq {
 }
 
 /// An HTTP response sealed back to the requester.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HttpResp {
     pub from: Vec<u8>,
     pub for_request_id: Vec<u8>,
@@ -210,7 +220,7 @@ pub struct HttpResp {
 
 /// A finished HNS resolution (DESIGN.md §30). `address` empty = the domain has no
 /// `_hopaddress` record (a resolution error, e.g. `hops://thisdoesnotexist.com`).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HnsRecord {
     pub domain: String,
     pub address: Vec<u8>,
@@ -218,7 +228,7 @@ pub struct HnsRecord {
 
 /// A live HNS cache entry for the debug view (DESIGN.md §30). `address` empty = a cached
 /// negative; `ttl_secs` is the remaining lifetime, ticking down to expiry.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HnsCacheEntry {
     pub domain: String,
     pub address: Vec<u8>,
@@ -226,7 +236,7 @@ pub struct HnsCacheEntry {
 }
 
 /// Outcome of starting an HNS resolution (DESIGN.md §30).
-#[derive(uniffi::Enum)]
+#[cfg_attr(feature = "full", derive(uniffi::Enum))]
 pub enum HnsLookupResult {
     /// Served from a fresh cache entry. `address` empty = a cached negative.
     Cached { address: Vec<u8> },
@@ -239,7 +249,7 @@ pub enum HnsLookupResult {
 }
 
 /// The kind of `hps://` topic hosted at a path (DESIGN.md §32).
-#[derive(uniffi::Enum)]
+#[cfg_attr(feature = "full", derive(uniffi::Enum))]
 pub enum HpsKind {
     /// Anyone with the content key reads AND writes; each post signed by its writer.
     Channel,
@@ -248,7 +258,7 @@ pub enum HpsKind {
 }
 
 /// Who may obtain a topic's keys (DESIGN.md §32).
-#[derive(uniffi::Enum)]
+#[cfg_attr(feature = "full", derive(uniffi::Enum))]
 pub enum HpsAccess {
     /// Keys handed to anyone who asks (anonymous membership).
     Open,
@@ -259,7 +269,7 @@ pub enum HpsAccess {
 }
 
 /// Whether a topic announces itself for discovery (DESIGN.md §32).
-#[derive(uniffi::Enum)]
+#[cfg_attr(feature = "full", derive(uniffi::Enum))]
 pub enum HpsVisibility {
     /// Reachable only by known address+path or an invite.
     Private,
@@ -268,7 +278,7 @@ pub enum HpsVisibility {
 }
 
 /// A received `hps://` message, after decryption + sender verification (DESIGN.md §32).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HpsMessage {
     pub path: String,
     /// The verified sender's address (for a channel, the writer; for a service, the host).
@@ -277,7 +287,7 @@ pub struct HpsMessage {
 }
 
 /// An invite we (member) received and may accept (DESIGN.md §32 Invite mode).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HpsInvite {
     pub path: String,
     pub host: Vec<u8>,
@@ -285,7 +295,7 @@ pub struct HpsInvite {
 }
 
 /// A discoverable topic surfaced by `browse_discoverable` (same-app only).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HpsTopicInfo {
     pub host: Vec<u8>,
     pub path: String,
@@ -296,7 +306,7 @@ pub struct HpsTopicInfo {
 }
 
 /// A topic we host or follow — for rebuilding the app's channel list after a restart.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HpsMyTopic {
     pub host: Vec<u8>,
     pub path: String,
@@ -340,14 +350,14 @@ fn vis_to_core(v: &HpsVisibility) -> hop_core::hps::Visibility {
 
 /// A live link to a directly-connected peer: its address + the bearer link id. The
 /// host maps the link id to a transport (e.g. < 10000 = Bluetooth, ≥ 10000 = Wi-Fi).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct PeerLink {
     pub address: Vec<u8>,
     pub link: u64,
 }
 
 /// Delivery status of a message we sent (Sending / Sent N / Delivered).
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct MessageStatus {
     /// Distinct peers we've handed a copy to ("Sent N").
     pub relayed: u32,
@@ -361,7 +371,7 @@ pub struct MessageStatus {
 }
 
 /// An item in the relay queue: ours awaiting send, or a peer's awaiting relay.
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct QueueItem {
     pub id: Vec<u8>,
     /// True = our own message (pinned). False = relaying for a peer (decays).
@@ -373,7 +383,8 @@ pub struct QueueItem {
 }
 
 /// Errors crossing the FFI boundary.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "full", derive(uniffi::Error))]
 pub enum FfiError {
     #[error("invalid key length (want 32 bytes)")]
     BadKey,
@@ -387,9 +398,9 @@ fn to32(v: &[u8]) -> std::result::Result<[u8; 32], FfiError> {
 
 /// A running Hop node the host drives. Thread-safe (interior `Mutex`), handed to
 /// the foreign side as a reference-counted object.
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "full", derive(uniffi::Object))]
 pub struct HopNode {
-    inner: Mutex<Node<SqliteStore>>,
+    inner: Mutex<Node<HopStore>>,
     /// True iff this node has durable storage. `open` sets it false only when the db path was
     /// unusable even after quarantine, so the host can tell the difference between persistent
     /// and silently-ephemeral (F-26). `new`/`with_secret` are ephemeral by construction.
@@ -403,8 +414,11 @@ pub struct HopNode {
 /// corrupt/read-only db becomes a clean fresh start rather than permanent per-launch amnesia.
 /// Returns `(store, persistent)`; only falls back to in-memory if even a fresh file won't open.
 /// See F-26 — the old code did `open(path).or_else(in_memory)`, so a bad path silently ran
-/// ephemeral forever with no signal to the host.
-fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
+/// ephemeral forever with no signal to the host. (core-ffi-03: SQLite-only, so the `minimal`
+/// embedded build compiles it out entirely.)
+#[cfg(not(feature = "minimal"))]
+fn open_store_persistent(db_path: &str, key: &[u8]) -> (HopStore, bool) {
+    use hop_store_sqlite::SqliteStore;
     // F-25: an empty key opens plain; a 32-byte key opens SQLCipher-encrypted (under the store's
     // `sqlcipher` feature).
     if let Ok(s) = SqliteStore::open_keyed(db_path, key) {
@@ -465,7 +479,9 @@ fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
 }
 
 /// Shared body of the `open` / `open_keyed` UniFFI constructors (F-25). A free function because UniFFI
-/// doesn't allow a private associated fn inside an exported impl.
+/// doesn't allow a private associated fn inside an exported impl. (core-ffi-03: SQLite-backed, so it is
+/// compiled only for the full build.)
+#[cfg(not(feature = "minimal"))]
 fn open_node_inner(db_path: &str, secret: &[u8], app_secret: &[u8], key: &[u8]) -> Arc<HopNode> {
     let (store, persistent) = open_store_persistent(db_path, key);
     let mut node = Node::with_store(identity_from(secret), store);
@@ -495,21 +511,36 @@ impl HopNode {
     /// until the app restarts. The node's own state is a plain in-memory structure with no cross-call
     /// invariant that a mid-mutation panic could leave in an unsafe-to-observe state, so recovering the
     /// guard is the right call: one bad call degrades to a dropped operation, not a dead node.
-    fn node(&self) -> std::sync::MutexGuard<'_, Node<SqliteStore>> {
+    fn node(&self) -> std::sync::MutexGuard<'_, Node<HopStore>> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-#[uniffi::export]
+/// A fresh EPHEMERAL store (core-ffi-03). The full build uses an in-memory SQLite; the `minimal`
+/// embedded build uses hop-core's in-memory store, so no SQLite is linked at all.
+fn fresh_ephemeral_store() -> HopStore {
+    #[cfg(not(feature = "minimal"))]
+    {
+        hop_store_sqlite::SqliteStore::open_in_memory().expect("in-memory sqlite")
+    }
+    #[cfg(feature = "minimal")]
+    {
+        hop_core::store::MemoryStore::new()
+    }
+}
+
+#[cfg_attr(feature = "full", uniffi::export)]
 impl HopNode {
     /// Create a node with a fresh identity and ephemeral in-memory storage.
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn new() -> Arc<Self> {
-        let store = SqliteStore::open_in_memory().expect("in-memory sqlite");
         Arc::new(Self {
-            inner: Mutex::new(Node::with_store(Identity::generate(), store)),
+            inner: Mutex::new(Node::with_store(
+                Identity::generate(),
+                fresh_ephemeral_store(),
+            )),
             persistent: false,
             rehydrate_dropped: 0,
         })
@@ -517,11 +548,13 @@ impl HopNode {
 
     /// Restore a node from a saved identity secret with ephemeral storage. Pass
     /// empty/invalid bytes to get a fresh identity.
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn with_secret(secret: Vec<u8>) -> Arc<Self> {
-        let store = SqliteStore::open_in_memory().expect("in-memory sqlite");
         Arc::new(Self {
-            inner: Mutex::new(Node::with_store(identity_from(&secret), store)),
+            inner: Mutex::new(Node::with_store(
+                identity_from(&secret),
+                fresh_ephemeral_store(),
+            )),
             persistent: false,
             rehydrate_dropped: 0,
         })
@@ -534,23 +567,43 @@ impl HopNode {
     /// app-secret bytes to stay on the open shared fabric. If the path can't be opened it is
     /// quarantined and reopened fresh; only if that also fails does it run ephemeral, and then
     /// [`HopNode::is_persistent`] returns false so the host can tell (F-26).
-    #[uniffi::constructor]
+    #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn open(db_path: String, secret: Vec<u8>, app_secret: Vec<u8>) -> Arc<Self> {
-        open_node_inner(&db_path, &secret, &app_secret, &[])
+        Self::open_keyed(db_path, secret, app_secret, Vec::new())
     }
 
     /// Like [`HopNode::open`], but ENCRYPTS the store at rest with a raw 32-byte `key` the host derives
     /// and stores in the platform Keychain/Keystore (F-25). Real encryption requires the store's
     /// `sqlcipher` cargo feature; without it the key is accepted but the db stays plain. An empty key
     /// behaves exactly like `open`.
-    #[uniffi::constructor]
+    ///
+    /// core-ffi-03: on the `minimal` embedded build there is no SQLite, so `db_path`/`key` are accepted
+    /// for ABI compatibility but the node runs EPHEMERAL (in-memory); `is_persistent()` reports false so
+    /// the host knows. An ESP32 host that wants durability supplies its own store via a future seam.
+    #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn open_keyed(
         db_path: String,
         secret: Vec<u8>,
         app_secret: Vec<u8>,
         key: Vec<u8>,
     ) -> Arc<Self> {
-        open_node_inner(&db_path, &secret, &app_secret, &key)
+        #[cfg(not(feature = "minimal"))]
+        {
+            open_node_inner(&db_path, &secret, &app_secret, &key)
+        }
+        #[cfg(feature = "minimal")]
+        {
+            let _ = (&db_path, &key); // no persistence on a constrained target — run ephemeral
+            let mut node = Node::with_store(identity_from(&secret), fresh_ephemeral_store());
+            if let Ok(s) = <[u8; 32]>::try_from(app_secret.as_slice()) {
+                node.set_app_keys(hop_core::app::AppKeys::from_secret(s));
+            }
+            Arc::new(Self {
+                inner: Mutex::new(node),
+                persistent: false,
+                rehydrate_dropped: 0,
+            })
+        }
     }
 
     /// Whether this node has durable storage. `false` means the db path was unusable and state

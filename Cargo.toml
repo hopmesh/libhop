@@ -19,8 +19,13 @@ hop-core.workspace = true
 # default-features = false so a mobile build can pick plain `bundled` OR encrypted `sqlcipher`
 # (they'd conflict if both bundling backends were active). The `bundled`/`sqlcipher` features below
 # forward the choice; the workspace default keeps plain SQLite for `cargo test --workspace`.
-hop-store-sqlite = { workspace = true, default-features = false }
-uniffi = "0.28"
+# OPTIONAL (core-ffi-03): the `minimal` embedded build drops the SQLite store entirely and runs the
+# in-memory store from hop-core, so this dependency is not compiled for a constrained target.
+hop-store-sqlite = { workspace = true, default-features = false, optional = true }
+# OPTIONAL (core-ffi-03): UniFFI scaffolding (the Swift/Kotlin ergonomic layer) is NOT compiled for a
+# constrained target — the `minimal` build exposes ONLY the cbindgen C ABI (`cabi.rs`), which is all an
+# ESP32 / bare-C client needs.
+uniffi = { version = "0.28", optional = true }
 thiserror.workspace = true
 bs58 = "0.5"
 postcard.workspace = true
@@ -34,8 +39,18 @@ required-features = ["cli"]
 [features]
 default = ["bundled"]
 cli = ["uniffi/cli"]
-# Plain SQLite at rest (the workspace default). Fast build, no OpenSSL.
-bundled = ["hop-store-sqlite/bundled"]
+# Plain SQLite at rest (the workspace default). Fast build, no OpenSSL. Pulls in the full (uniffi +
+# SQLite) surface. `bundled`/`sqlcipher` are the two mobile at-rest backends (mutually exclusive).
+bundled = ["full", "hop-store-sqlite/bundled"]
 # SQLCipher-encrypted at rest (F-25). Build the MOBILE libhop with this so `open_keyed` actually
 # encrypts: `cargo build -p hop --no-default-features --features sqlcipher --target <mobile>`.
-sqlcipher = ["hop-store-sqlite/sqlcipher"]
+sqlcipher = ["full", "hop-store-sqlite/sqlcipher"]
+# The full client surface: the UniFFI ergonomic layer + a SQLite-backed store. Every non-embedded
+# target (mobile, host tools, tests) uses this. `minimal` is its opposite (see below).
+full = ["dep:uniffi", "dep:hop-store-sqlite"]
+# core-ffi-03: a CONSTRAINED-TARGET build. Drops UniFFI scaffolding AND the SQLite store, backing the
+# node with hop-core's in-memory store so `libhop.a` is a pure `no_std`-adjacent, allocator-only C ABI
+# suitable for an ESP32 (Xtensa/RISC-V) where bundled SQLite + UniFFI won't fit. Build it with:
+#   cargo build -p hop --no-default-features --features minimal --target riscv32imc-unknown-none-elf
+# (host smoke-check: `cargo build -p hop --no-default-features --features minimal`).
+minimal = []
