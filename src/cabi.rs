@@ -848,6 +848,25 @@ mod tests {
         (aa, ba)
     }
 
+    /// Like [`connect`] but WITHOUT gossiping prekeys: brings up the bearer link and pumps the
+    /// handshake so the two nodes are authenticated peers, yet neither knows the other's prekey. A
+    /// `hop_send_message` here has no session material to ratchet against, so it MUST defer (never
+    /// static-seal) until a prekey arrives. Uses the SAME link ids as `connect` so `pump(a, 11, b, 22)`
+    /// works unchanged.
+    unsafe fn link_only(a: *const HopNode, b: *const HopNode) -> ([u8; 32], [u8; 32]) {
+        const LA: u64 = 11;
+        const LB: u64 = 22;
+        hop_node_tick(a, 1_000);
+        hop_node_tick(b, 1_000);
+        hop_link_up(a, LA, HopLinkRole::Dialer as u32);
+        hop_link_up(b, LB, HopLinkRole::Acceptor as u32);
+        pump(a, LA, b, LB);
+        let (mut aa, mut ba) = ([0u8; 32], [0u8; 32]);
+        assert!(hop_node_address(a, aa.as_mut_ptr()));
+        assert!(hop_node_address(b, ba.as_mut_ptr()));
+        (aa, ba)
+    }
+
     /// Inbox collector for `hop_poll_inbox`.
     struct InboxCollector {
         msgs: Vec<(Vec<u8>, String, Vec<u8>, u8)>,
@@ -1015,6 +1034,107 @@ mod tests {
                 hop_is_secured(a, ba.as_ptr()),
                 "A now holds a ratchet session to B: the lock shows"
             );
+            // The lock claim is only honest if the content ACTUALLY rode that session end to end. Pump
+            // it to B and prove B decrypts the exact body: a forward-secret delivery, not a bare
+            // handshake side effect. (Without this the test could pass on any session-establishing
+            // artifact and the "forward-secret message" claim would outrun what it verified.)
+            pump(a, 11, b, 22);
+            let inbox = poll_inbox(b);
+            assert_eq!(inbox.len(), 1, "exactly one message arrived at B");
+            assert_eq!(
+                inbox[0].2.as_slice(),
+                &body[..],
+                "B decrypted the forward-secret body: the message rode the ratchet, not a static seal"
+            );
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    #[test]
+    fn send_without_a_known_prekey_defers_never_static_seals_then_flushes_ratcheted() {
+        // The critical §25 invariant at the C ABI: content is ALWAYS forward-secret. A
+        // hop_send_message to a peer whose prekey we do NOT yet hold must NOT static-seal or ship
+        // anything in the clear; it defers ("Securing…") until the prekey arrives, then sends
+        // ratcheted. Every other ABI test pre-connects via `connect` (which gossips prekeys on both
+        // sides), so this deferral path had no ABI coverage. Drive it entirely through the raw ABI.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            // Linked + authenticated, but NO prekey gossiped: A cannot ratchet to B yet.
+            let (_aa, ba) = link_only(a, b);
+            assert!(
+                !hop_is_secured(a, ba.as_ptr()),
+                "no session before any send (and no prekey to open one)"
+            );
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"defer me until the prekey lands";
+            let mut handle = [0u8; 32];
+            assert!(
+                hop_send_message(
+                    a,
+                    ba.as_ptr(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    true,
+                    handle.as_mut_ptr(),
+                ),
+                "the send is ACCEPTED (deferred) even without a prekey, returning a stable handle"
+            );
+            assert_ne!(handle, [0u8; 32], "a real deferral handle was written");
+
+            // (a) Nothing went out statically/unencrypted. Pump the wire: B's inbox is EMPTY (no
+            // static-sealed content leaked) and A still has NO ratchet session to B.
+            pump(a, 11, b, 22);
+            assert!(
+                poll_inbox(b).is_empty(),
+                "a deferred send must NOT static-seal: nothing reaches B before the prekey"
+            );
+            assert!(
+                !hop_is_secured(a, ba.as_ptr()),
+                "still no forward-secret session: the content was deferred, not sealed"
+            );
+            // The deferred message reports not-yet-delivered.
+            let mut delivered = true;
+            assert!(hop_message_status(
+                a,
+                handle.as_ptr(),
+                std::ptr::null_mut(),
+                &mut delivered,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            assert!(
+                !delivered,
+                "the deferred send is tracked as not-yet-delivered"
+            );
+
+            // (b) Now B publishes + gossips its prekey. A must flush the deferred content RATCHETED:
+            // the session flips secured only now (proving forward secrecy), and B decrypts the exact
+            // body. Publishing the prekey requires a real clock on B (adverts aren't judged expired).
+            hop_node_tick(b, 1_000);
+            assert!(hop_publish_prekey(b), "B publishes its prekey");
+            pump(a, 11, b, 22); // gossip the prekey to A, which flushes the deferred send
+            pump(a, 11, b, 22); // shuttle the now-ratcheted content to B
+
+            assert!(
+                hop_is_secured(a, ba.as_ptr()),
+                "is_secured flips true ONLY after the deferred content was sent forward-secret"
+            );
+            let inbox = poll_inbox(b);
+            assert_eq!(
+                inbox.len(),
+                1,
+                "the once-deferred message finally arrived at B"
+            );
+            assert_eq!(
+                inbox[0].2.as_slice(),
+                &body[..],
+                "B decrypted the exact deferred body: it flushed ratcheted, never static-sealed"
+            );
+
             hop_node_free(a);
             hop_node_free(b);
         }
