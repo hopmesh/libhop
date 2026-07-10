@@ -97,8 +97,14 @@ void hop_node_set_name(const struct HopNode *node, const char *name);
 // Advance time: expire adverts, retransmit unacked bundles, prune dedup. Call ~1 Hz.
 void hop_node_tick(const struct HopNode *node, uint64_t now_ms);
 
-// A bearer link came up. `role` = which side dialed (the Noise initiator/responder selector).
-void hop_link_up(const struct HopNode *node, uint64_t link, enum HopLinkRole role);
+// A bearer link came up. `role` = which side dialed (the Noise initiator/responder selector),
+// using the [`HopLinkRole`] discriminants (0 = Dialer, 1 = Acceptor).
+//
+// core-ffi-05: `role` is taken as a plain `u32`, not the `HopLinkRole` enum by value. A C caller
+// passing an out-of-range int would otherwise materialize an invalid Rust enum (instant UB) before
+// any validation runs. Here only `0` selects Dialer; any other value is treated as Acceptor, so a
+// bad int can never be UB.
+void hop_link_up(const struct HopNode *node, uint64_t link, uint32_t role);
 
 // One frame of opaque bytes arrived on `link`.
 void hop_bytes_received(const struct HopNode *node,

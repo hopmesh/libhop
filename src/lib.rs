@@ -406,10 +406,44 @@ pub struct HopNode {
 /// ephemeral forever with no signal to the host.
 fn open_store_persistent(db_path: &str, key: &[u8]) -> (SqliteStore, bool) {
     // F-25: an empty key opens plain; a 32-byte key opens SQLCipher-encrypted (under the store's
-    // `sqlcipher` feature). Same quarantine-on-failure behavior either way.
+    // `sqlcipher` feature).
     if let Ok(s) = SqliteStore::open_keyed(db_path, key) {
         return (s, true);
     }
+
+    // stores-05 / android-01: a KEYED open of an EXISTING db failed. Never quarantine-wipe here — a
+    // transient wrong key (e.g. a config path that forgot to pass the key, then a keyed restart) must
+    // not destroy sessions/prekeys/queued sends. Two sub-cases:
+    if !key.is_empty() && std::path::Path::new(db_path).exists() {
+        // (a) The existing file is an unencrypted db and we now hold a key -> migrate it in place
+        //     (plaintext -> SQLCipher) so at-rest encryption turns on WITHOUT data loss.
+        #[cfg(feature = "sqlcipher")]
+        if SqliteStore::opens_as_plaintext(db_path) {
+            match SqliteStore::migrate_plaintext_to_keyed(db_path, key) {
+                Ok(s) => {
+                    eprintln!(
+                        "hop: migrated plaintext db at {db_path} to SQLCipher (state preserved)"
+                    );
+                    return (s, true);
+                }
+                Err(e) => eprintln!("hop: WARNING plaintext->SQLCipher migration failed: {e}"),
+            }
+        }
+        // (b) Wrong key / genuine corruption on an existing keyed db. FAIL CLOSED: run ephemeral this
+        //     session and LEAVE THE FILE INTACT so a later correct-key open recovers it. is_persistent()
+        //     is false, which the host must surface (do not silently churn state).
+        eprintln!(
+            "hop: WARNING keyed open of existing db {db_path} failed (wrong key or corruption); \
+             running EPHEMERAL this session and PRESERVING the file. is_persistent() is false."
+        );
+        return (
+            SqliteStore::open_in_memory().expect("in-memory sqlite"),
+            false,
+        );
+    }
+
+    // Empty-key (plain) path, or the file does not exist: a genuinely unusable/corrupt PLAIN db has no
+    // key ambiguity, so quarantine it aside and start fresh (F-26). No secret state is encrypted here.
     let quarantine = format!("{db_path}.corrupt");
     let _ = std::fs::remove_file(&quarantine);
     if std::fs::rename(db_path, &quarantine).is_ok() {
@@ -452,6 +486,20 @@ fn open_node_inner(db_path: &str, secret: &[u8], app_secret: &[u8], key: &[u8]) 
         persistent,
         rehydrate_dropped: report.total(),
     })
+}
+
+impl HopNode {
+    /// Poison-tolerant lock on the inner node (core-ffi-01). If a prior call panicked while holding
+    /// the lock (e.g. a panic reached across the C ABI, or a UniFFI call that unwound), the standard
+    /// `.lock().unwrap()` would panic on EVERY subsequent call, permanently bricking the node object
+    /// until the app restarts. The node's own state is a plain in-memory structure with no cross-call
+    /// invariant that a mid-mutation panic could leave in an unsafe-to-observe state, so recovering the
+    /// guard is the right call: one bad call degrades to a dropped operation, not a dead node.
+    fn node(&self) -> std::sync::MutexGuard<'_, Node<SqliteStore>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[uniffi::export]
@@ -526,12 +574,12 @@ impl HopNode {
 
     /// Export this node's identity secret to persist (store it in the Keychain).
     pub fn secret(&self) -> Vec<u8> {
-        self.inner.lock().unwrap().identity_secret().to_vec()
+        self.node().identity_secret().to_vec()
     }
 
     /// This node's hop address (Ed25519 public key).
     pub fn address(&self) -> Vec<u8> {
-        self.inner.lock().unwrap().address().to_vec()
+        self.node().address().to_vec()
     }
 
     /// A bearer connection came up; `initiator` = we dialed it (BLE central).
@@ -541,33 +589,22 @@ impl HopNode {
         } else {
             Role::Responder
         };
-        self.inner
-            .lock()
-            .unwrap()
-            .handle(BearerEvent::Connected(link, role));
+        self.node().handle(BearerEvent::Connected(link, role));
     }
 
     /// A bearer connection dropped.
     pub fn disconnected(&self, link: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .handle(BearerEvent::Disconnected(link));
+        self.node().handle(BearerEvent::Disconnected(link));
     }
 
     /// Bytes arrived on a connection.
     pub fn received(&self, link: u64, bytes: Vec<u8>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .handle(BearerEvent::Data(link, bytes));
+        self.node().handle(BearerEvent::Data(link, bytes));
     }
 
     /// Bytes the host must send over the bearer (then clears them).
     pub fn drain_outgoing(&self) -> Vec<OutPacket> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .drain_outgoing()
             .into_iter()
             .map(|(link, bytes)| OutPacket { link, bytes })
@@ -576,12 +613,12 @@ impl HopNode {
 
     /// Advance time: expire adverts, retransmit unacked bundles, prune dedup.
     pub fn tick(&self, now_ms: u64) {
-        self.inner.lock().unwrap().tick(now_ms);
+        self.node().tick(now_ms);
     }
 
     /// Subscribe the directory to a service topic.
     pub fn subscribe(&self, topic: String) {
-        self.inner.lock().unwrap().subscribe(topic);
+        self.node().subscribe(topic);
     }
 
     /// Send a peer message to `dst` (an address — sealing key is derived from it).
@@ -597,9 +634,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let dst = to32(&dst)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_message(dst, content_type, body, request_ack)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -617,9 +652,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let dst = to32(&dst)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_message_traced(dst, content_type, body, request_ack)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -638,9 +671,7 @@ impl HopNode {
         ttl_ms: u32,
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .publish_service(service, title, summary, tags, ttl_ms)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -650,9 +681,7 @@ impl HopNode {
     /// across the mesh, with hop distance. Pass an empty `tag` for no filter.
     pub fn browse(&self, service: String, tag: String) -> Vec<ServiceHit> {
         let tag = if tag.is_empty() { None } else { Some(tag) };
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .browse(&service, tag.as_deref())
             .into_iter()
             .filter_map(|a| match a.body.kind {
@@ -687,7 +716,7 @@ impl HopNode {
             Ok(i) => i,
             Err(_) => return blank,
         };
-        match self.inner.lock().unwrap().message_status(&id) {
+        match self.node().message_status(&id) {
             Some((relayed, delivered, delivery_hops, delivery_ms)) => MessageStatus {
                 relayed,
                 delivered,
@@ -701,14 +730,12 @@ impl HopNode {
     /// Clear the relay queue: drop our undelivered messages (stop retransmitting) and any
     /// bundles held for peers. Does not touch chat history or sessions.
     pub fn clear_queue(&self) {
-        self.inner.lock().unwrap().clear_queue();
+        self.node().clear_queue();
     }
 
     /// The relay queue: our messages awaiting send (pinned) + peers' awaiting relay.
     pub fn queue(&self) -> Vec<QueueItem> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .queue()
             .into_iter()
             .map(|q| QueueItem {
@@ -725,27 +752,21 @@ impl HopNode {
     /// rather than static-sealed (DESIGN.md §25). Drives a lock indicator in the UI.
     pub fn is_secured(&self, address: Vec<u8>) -> bool {
         match to32(&address) {
-            Ok(a) => self.inner.lock().unwrap().has_session(&a),
+            Ok(a) => self.node().has_session(&a),
             Err(_) => false,
         }
     }
 
     /// Addresses of currently-connected, authenticated peers.
     pub fn peers(&self) -> Vec<Vec<u8>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .peers()
-            .iter()
-            .map(|a| a.to_vec())
-            .collect()
+        self.node().peers().iter().map(|a| a.to_vec()).collect()
     }
 
     /// Whether this node has learned a live route toward `address` from observed
     /// deliveries (DESIGN.md §27). Drives a "known route" indicator in the UI.
     pub fn knows_route(&self, address: Vec<u8>) -> bool {
         match to32(&address) {
-            Ok(a) => self.inner.lock().unwrap().knows_route(&a),
+            Ok(a) => self.node().knows_route(&a),
             Err(_) => false,
         }
     }
@@ -753,9 +774,7 @@ impl HopNode {
     /// Live links `(address, link id)` — the host maps link ids to transports to show
     /// the route to each direct neighbour.
     pub fn peer_links(&self) -> Vec<PeerLink> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .peer_links()
             .into_iter()
             .map(|(address, link)| PeerLink {
@@ -776,9 +795,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let address = to32(&address)?;
         match self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_to(&address, content_type, body, request_ack)
             .map_err(|e| FfiError::Hop(e.to_string()))?
         {
@@ -790,7 +807,7 @@ impl HopNode {
     /// Drain decrypted messages addressed to this node since the last call. Handles
     /// both static-sealed and forward-secret session messages uniformly.
     pub fn take_inbox(&self) -> Vec<InboxMessage> {
-        let mut node = self.inner.lock().unwrap();
+        let mut node = self.node();
         let bundles = node.take_inbox();
         bundles
             .iter()
@@ -821,9 +838,7 @@ impl HopNode {
     /// advert id.
     pub fn publish_prekey(&self) -> std::result::Result<Vec<u8>, FfiError> {
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .publish_prekey()
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -831,7 +846,7 @@ impl HopNode {
 
     /// Number of locally-sent bundles still awaiting an ACK.
     pub fn pending_count(&self) -> u32 {
-        self.inner.lock().unwrap().pending_count() as u32
+        self.node().pending_count() as u32
     }
 
     /// Send a `hops://` request sealed and addressed to a specific endpoint's Hop address
@@ -849,9 +864,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let ep = to32(&endpoint)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_hops_request(ep, host, method, url, vec![], body, max_resp)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -863,17 +876,17 @@ impl HopNode {
     /// on, the host must service `take_dns_lookups` so the node can resolve HNS on its own
     /// without any relay round-trip.
     pub fn set_internet(&self, on: bool) {
-        self.inner.lock().unwrap().set_internet(on);
+        self.node().set_internet(on);
     }
 
     /// Whether this device is marked internet-connected.
     pub fn is_internet(&self) -> bool {
-        self.inner.lock().unwrap().is_internet()
+        self.node().is_internet()
     }
 
     /// Resolve `domain` to its hops endpoint address (DESIGN.md §30). See [`HnsLookupResult`].
     pub fn resolve_hns(&self, domain: String) -> HnsLookupResult {
-        match self.inner.lock().unwrap().resolve_hns(&domain) {
+        match self.node().resolve_hns(&domain) {
             HnsLookup::Cached(Some(addr)) => HnsLookupResult::Cached {
                 address: addr.to_vec(),
             },
@@ -892,9 +905,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let r = to32(&resolver)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .resolve_hns_via(r, &domain)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -906,24 +917,19 @@ impl HopNode {
     /// then hand the raw response bodies to `provide_dns_proof`. Core validates; the host never
     /// decides the address.
     pub fn take_dns_lookups(&self) -> Vec<String> {
-        self.inner.lock().unwrap().take_dns_lookups()
+        self.node().take_dns_lookups()
     }
 
     /// Feed back the raw DoH response bodies for a domain's chain. Core validates the DNSSEC
     /// chain to the root anchors and caches the address only if it verifies (DESIGN.md §30).
     pub fn provide_dns_proof(&self, domain: String, bodies: Vec<String>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .provide_dns_proof(&domain, bodies);
+        self.node().provide_dns_proof(&domain, bodies);
     }
 
     /// A snapshot of the live HNS cache (for the debug view): each cached domain, its address
     /// (empty = negative), and the remaining TTL in seconds (ticks down to expiry).
     pub fn hns_cache(&self) -> Vec<HnsCacheEntry> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .hns_cache_snapshot()
             .into_iter()
             .map(|(domain, addr, remaining_ms)| HnsCacheEntry {
@@ -936,9 +942,7 @@ impl HopNode {
 
     /// Finished HNS resolutions (positive or negative), clearing the queue.
     pub fn take_hns_results(&self) -> Vec<HnsRecord> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_hns_results()
             .into_iter()
             .map(|r| HnsRecord {
@@ -960,9 +964,7 @@ impl HopNode {
         access: HpsAccess,
         visibility: HpsVisibility,
     ) -> Vec<u8> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .register_service(
                 &path,
                 kind_to_core(&kind),
@@ -982,9 +984,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let dest = to32(&dest)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_invite(&path, dest)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -998,9 +998,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let host = to32(&host)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_accept_invite(host, &path)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1013,15 +1011,13 @@ impl HopNode {
         path: String,
     ) -> std::result::Result<(), FfiError> {
         let host = to32(&host)?;
-        self.inner.lock().unwrap().hps_decline_invite(host, &path);
+        self.node().hps_decline_invite(host, &path);
         Ok(())
     }
 
     /// Drain invites we've received (DESIGN.md §32 Invite mode), clearing them.
     pub fn take_hps_invites(&self) -> Vec<HpsInvite> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_hps_invites()
             .into_iter()
             .map(|i| HpsInvite {
@@ -1035,9 +1031,7 @@ impl HopNode {
     /// Member → host: leave a topic (stop being re-keyed). Returns the leave bundle id, if any.
     pub fn hps_leave(&self, path: String) -> std::result::Result<Vec<u8>, FfiError> {
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_leave(&path)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.map(|b| b.to_vec()).unwrap_or_default())
@@ -1045,9 +1039,7 @@ impl HopNode {
 
     /// Host: pending join requests for a RequestToJoin topic (each is a requester address).
     pub fn hps_pending(&self, path: String) -> Vec<Vec<u8>> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .hps_pending(&path)
             .into_iter()
             .map(|a| a.to_vec())
@@ -1062,9 +1054,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let requester = to32(&requester)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_approve(&path, requester)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1073,7 +1063,7 @@ impl HopNode {
     /// Host: deny/drop a pending requester (no keys).
     pub fn hps_deny(&self, path: String, requester: Vec<u8>) -> std::result::Result<(), FfiError> {
         let requester = to32(&requester)?;
-        self.inner.lock().unwrap().hps_deny(&path, requester);
+        self.node().hps_deny(&path, requester);
         Ok(())
     }
 
@@ -1096,9 +1086,7 @@ impl HopNode {
             Some(new_path.as_str())
         };
         let ids = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_rekey(&path, np, &removed)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(ids.into_iter().map(|b| b.to_vec()).collect())
@@ -1106,14 +1094,12 @@ impl HopNode {
 
     /// Host: unique acking addresses for a topic (its reach / delivery sense, DESIGN.md §32).
     pub fn hps_reach(&self, path: String) -> u32 {
-        self.inner.lock().unwrap().hps_reach(&path) as u32
+        self.node().hps_reach(&path) as u32
     }
 
     /// Host: the retained-member set (addresses) for a topic.
     pub fn hps_members(&self, path: String) -> Vec<Vec<u8>> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .hps_members(&path)
             .into_iter()
             .map(|a| a.to_vec())
@@ -1123,9 +1109,7 @@ impl HopNode {
     /// Topics this node hosts or follows — the app calls this at startup to rebuild its channel
     /// list, since the node persists topics but the app's in-memory list doesn't.
     pub fn hps_my_topics(&self) -> Vec<HpsMyTopic> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .hps_my_topics()
             .into_iter()
             .map(|t| HpsMyTopic {
@@ -1140,9 +1124,7 @@ impl HopNode {
 
     /// Same-app discoverable topics visible on the mesh (decrypted descriptors + host address).
     pub fn browse_discoverable(&self) -> Vec<HpsTopicInfo> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .browse_discoverable(None)
             .into_iter()
             .map(|(host, m)| HpsTopicInfo {
@@ -1166,9 +1148,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let host = to32(&host)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_subscribe(host, &path)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1182,9 +1162,7 @@ impl HopNode {
         body: Vec<u8>,
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .hps_publish(&path, &body)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1192,9 +1170,7 @@ impl HopNode {
 
     /// Drain received `hps://` messages (already decrypted + sender-verified), clearing them.
     pub fn take_hps_messages(&self) -> Vec<HpsMessage> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_hps_messages()
             .into_iter()
             .map(|m| HpsMessage {
@@ -1215,9 +1191,7 @@ impl HopNode {
     ) -> std::result::Result<(), FfiError> {
         let to = to32(&to)?;
         let for_id = to32(&for_request_id)?;
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .send_http_response(to, for_id, status, vec![], body)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(())
@@ -1225,9 +1199,7 @@ impl HopNode {
 
     /// Drain egress HTTP requests addressed to this node as a gateway.
     pub fn take_http_requests(&self) -> Vec<HttpReq> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_http_requests()
             .into_iter()
             .map(|r| HttpReq {
@@ -1244,9 +1216,7 @@ impl HopNode {
 
     /// Drain HTTP responses sealed back to this node as a requester.
     pub fn take_http_responses(&self) -> Vec<HttpResp> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_http_responses()
             .into_iter()
             .map(|r| HttpResp {
@@ -1271,17 +1241,12 @@ impl HopNode {
     /// short address).
     pub fn set_name(&self, name: String) {
         let name = if name.is_empty() { None } else { Some(name) };
-        self.inner.lock().unwrap().set_name(name);
+        self.node().set_name(name);
     }
 
     /// This node's display name (empty string if unset).
     pub fn name(&self) -> String {
-        self.inner
-            .lock()
-            .unwrap()
-            .name()
-            .unwrap_or_default()
-            .to_string()
+        self.node().name().unwrap_or_default().to_string()
     }
 
     /// Call a service/command on `dst` (DESIGN.md §29). For the built-in identity
@@ -1297,9 +1262,7 @@ impl HopNode {
     ) -> std::result::Result<Vec<u8>, FfiError> {
         let dst = to32(&dst)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_service_request(dst, service, method, args)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1317,9 +1280,7 @@ impl HopNode {
         let to = to32(&to)?;
         let for_id = to32(&for_request_id)?;
         let id = self
-            .inner
-            .lock()
-            .unwrap()
+            .node()
             .send_service_response(to, for_id, status, body)
             .map_err(|e| FfiError::Hop(e.to_string()))?;
         Ok(id.to_vec())
@@ -1328,9 +1289,7 @@ impl HopNode {
     /// Drain custom service requests addressed to this node (built-in `hop.` services
     /// are answered by the node and never appear here).
     pub fn take_service_requests(&self) -> Vec<ServiceReq> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_service_requests()
             .into_iter()
             .map(|r| ServiceReq {
@@ -1345,9 +1304,7 @@ impl HopNode {
 
     /// Drain service responses sealed back to this node as a caller.
     pub fn take_service_responses(&self) -> Vec<ServiceResp> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.node()
             .take_service_responses()
             .into_iter()
             .map(|r| ServiceResp {

@@ -71,6 +71,15 @@ fn catch_ctor(f: impl FnOnce() -> *const HopNode) -> *const HopNode {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(std::ptr::null())
 }
 
+/// Run a closure, swallowing any panic so it can never unwind across the `extern "C"` boundary
+/// (which is UB and aborts the whole host process) (core-ffi-01). A panic in hop-core reached via
+/// hostile/malformed network bytes (`hop_bytes_received`) must degrade to a dropped operation, not
+/// take down every C-ABI consumer (ESP32, C tools, JNA/Swift wrappers). The node's lock is
+/// poison-tolerant, so a panic mid-call does not brick the node either. Returns `r` on panic.
+fn catch<R>(default: R, f: impl FnOnce() -> R) -> R {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(default)
+}
+
 /// Open a node with persistent storage at `db_path` (UTF-8 C string), a saved 32-byte identity
 /// `secret` (pass NULL/0 for a fresh identity), and a 32-byte `app_secret` (NULL/0 = open fabric).
 /// Returns an owning handle to free with `hop_node_free`, or NULL on a NULL/non-UTF-8 `db_path`.
@@ -203,19 +212,30 @@ pub unsafe extern "C" fn hop_node_set_name(node: *const HopNode, name: *const c_
 /// Advance time: expire adverts, retransmit unacked bundles, prune dedup. Call ~1 Hz.
 #[no_mangle]
 pub unsafe extern "C" fn hop_node_tick(node: *const HopNode, now_ms: u64) {
-    if let Some(node) = node_ref(node) {
-        node.tick(now_ms);
-    }
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            node.tick(now_ms);
+        }
+    })
 }
 
 // ---- bearer seam: inbound (bearer -> core) ----------------------------------------------------
 
-/// A bearer link came up. `role` = which side dialed (the Noise initiator/responder selector).
+/// A bearer link came up. `role` = which side dialed (the Noise initiator/responder selector),
+/// using the [`HopLinkRole`] discriminants (0 = Dialer, 1 = Acceptor).
+///
+/// core-ffi-05: `role` is taken as a plain `u32`, not the `HopLinkRole` enum by value. A C caller
+/// passing an out-of-range int would otherwise materialize an invalid Rust enum (instant UB) before
+/// any validation runs. Here only `0` selects Dialer; any other value is treated as Acceptor, so a
+/// bad int can never be UB.
 #[no_mangle]
-pub unsafe extern "C" fn hop_link_up(node: *const HopNode, link: u64, role: HopLinkRole) {
-    if let Some(node) = node_ref(node) {
-        node.connected(link, matches!(role, HopLinkRole::Dialer));
-    }
+pub unsafe extern "C" fn hop_link_up(node: *const HopNode, link: u64, role: u32) {
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            let is_dialer = role == HopLinkRole::Dialer as u32;
+            node.connected(link, is_dialer);
+        }
+    })
 }
 
 /// One frame of opaque bytes arrived on `link`.
@@ -226,17 +246,21 @@ pub unsafe extern "C" fn hop_bytes_received(
     data: *const u8,
     len: usize,
 ) {
-    if let Some(node) = node_ref(node) {
-        node.received(link, slice(data, len).to_vec());
-    }
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            node.received(link, slice(data, len).to_vec());
+        }
+    })
 }
 
 /// A bearer link dropped.
 #[no_mangle]
 pub unsafe extern "C" fn hop_link_down(node: *const HopNode, link: u64) {
-    if let Some(node) = node_ref(node) {
-        node.disconnected(link);
-    }
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            node.disconnected(link);
+        }
+    })
 }
 
 // ---- bearer seam: outbound (core -> bearer, POLLED) -------------------------------------------
@@ -253,7 +277,10 @@ pub unsafe extern "C" fn hop_drain_outgoing(
     let (Some(node), Some(sink)) = (node_ref(node), sink) else {
         return;
     };
-    for pkt in node.drain_outgoing() {
+    // core-ffi-01: the node-side drain may panic; contain it so it can't unwind across the ABI. The
+    // sink is a foreign fn: if IT panics that's the host's contract to uphold, outside our reach.
+    let packets = catch(Vec::new(), || node.drain_outgoing());
+    for pkt in packets {
         sink(ctx, pkt.link, pkt.bytes.as_ptr(), pkt.bytes.len());
     }
 }
@@ -299,7 +326,8 @@ pub unsafe extern "C" fn hop_poll_inbox(
     let (Some(node), Some(sink)) = (node_ref(node), sink) else {
         return;
     };
-    for m in node.take_inbox() {
+    let inbox = catch(Vec::new(), || node.take_inbox());
+    for m in inbox {
         let ct = std::ffi::CString::new(m.content_type).unwrap_or_default();
         sink(
             ctx,
@@ -589,27 +617,95 @@ pub unsafe extern "C" fn hop_send_message(
     request_ack: bool,
     out_id: *mut u8,
 ) -> bool {
-    let Some(node) = node_ref(node) else {
-        return false;
-    };
-    let Some(ct) = cstr(content_type) else {
-        return false;
-    };
-    if dst.is_null() {
-        return false;
-    }
-    match node.send_message(
-        slice(dst, 32).to_vec(),
-        ct.to_string(),
-        slice(body, body_len).to_vec(),
-        request_ack,
-    ) {
-        Ok(id) => {
-            if !out_id.is_null() {
-                std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
-            }
-            true
+    catch(false, || {
+        let Some(node) = node_ref(node) else {
+            return false;
+        };
+        let Some(ct) = cstr(content_type) else {
+            return false;
+        };
+        if dst.is_null() {
+            return false;
         }
-        Err(_) => false,
+        match node.send_message(
+            slice(dst, 32).to_vec(),
+            ct.to_string(),
+            slice(body, body_len).to_vec(),
+            request_ack,
+        ) {
+            Ok(id) => {
+                if !out_id.is_null() {
+                    std::ptr::copy_nonoverlapping(id.as_ptr(), out_id, id.len().min(32));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    //! quality-net-08: direct tests of the C ABI entry points (they had none; only the higher-level
+    //! Rust API and the foreign wrappers were exercised). These call the `extern "C"` functions the
+    //! way a C/Swift/Kotlin host does - through raw pointers - so a regression in the ABI seam itself
+    //! (not just the Rust core) is caught here rather than only on-device.
+    use super::*;
+
+    #[test]
+    fn abi_version_matches_the_constant() {
+        assert_eq!(hop_abi_version(), HOP_ABI_VERSION);
+    }
+
+    #[test]
+    fn null_handles_are_safe_and_falsey() {
+        // Every accessor must tolerate a NULL handle (a host that failed a ctor) without UB.
+        unsafe {
+            let mut buf = [0u8; 32];
+            assert!(!hop_node_address(std::ptr::null(), buf.as_mut_ptr()));
+            assert_eq!(hop_node_secret(std::ptr::null(), buf.as_mut_ptr()), 0);
+            assert!(!hop_node_is_persistent(std::ptr::null()));
+            assert_eq!(hop_node_rehydrate_dropped(std::ptr::null()), 0);
+            hop_node_free(std::ptr::null()); // documented no-op on NULL
+        }
+    }
+
+    #[test]
+    fn new_node_yields_a_nonzero_address_then_frees() {
+        unsafe {
+            let node = hop_node_new();
+            assert!(!node.is_null(), "ctor returns a handle");
+            let mut addr = [0u8; 32];
+            assert!(hop_node_address(node, addr.as_mut_ptr()));
+            assert_ne!(addr, [0u8; 32], "a real Ed25519 address, not zeros");
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn with_secret_is_deterministic_across_the_abi() {
+        // The whole point of hop_node_secret + hop_node_with_secret: a host persists the secret and
+        // restores the SAME identity. Prove the address round-trips through the C ABI.
+        unsafe {
+            let seed = [7u8; 32];
+            let a = hop_node_with_secret(seed.as_ptr(), seed.len());
+            let b = hop_node_with_secret(seed.as_ptr(), seed.len());
+            let (mut aa, mut ba) = ([0u8; 32], [0u8; 32]);
+            assert!(hop_node_address(a, aa.as_mut_ptr()));
+            assert!(hop_node_address(b, ba.as_mut_ptr()));
+            assert_eq!(aa, ba, "same secret -> same identity through the ABI");
+
+            // And the secret read back out re-creates the same identity.
+            let mut secret_out = [0u8; 32];
+            assert_eq!(hop_node_secret(a, secret_out.as_mut_ptr()), 32);
+            let c = hop_node_with_secret(secret_out.as_ptr(), secret_out.len());
+            let mut ca = [0u8; 32];
+            assert!(hop_node_address(c, ca.as_mut_ptr()));
+            assert_eq!(ca, aa, "secret read back re-creates the identity");
+
+            hop_node_free(a);
+            hop_node_free(b);
+            hop_node_free(c);
+        }
     }
 }

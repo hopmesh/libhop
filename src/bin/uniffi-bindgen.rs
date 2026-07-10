@@ -1,8 +1,8 @@
-//! Generates the foreign-language bindings (Swift/Kotlin) for `hop-ffi`.
+//! Generates the foreign-language bindings (Swift/Kotlin) for the `hop` crate.
 //!
 //! Usage (library mode, after building the cdylib):
-//!   cargo run -p hop-ffi --features cli --bin uniffi-bindgen -- \
-//!     generate --library target/debug/libhop_ffi.dylib \
+//!   cargo run -p hop --features cli --bin uniffi-bindgen -- \
+//!     generate --library target/debug/libhop.dylib \
 //!     --language swift --out-dir target/bindings/swift
 
 fn main() {
