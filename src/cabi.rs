@@ -778,6 +778,835 @@ mod tests {
         assert_eq!(catch(Vec::new(), || vec![1u8, 2, 3]), vec![1, 2, 3]);
     }
 
+    // ---- test harness: wire two in-process nodes together through the C ABI ------------------
+    //
+    // A C/Swift/Kotlin host feeds bearer bytes in via `hop_bytes_received` and pumps them out via
+    // `hop_drain_outgoing`. This harness plays the bearer for TWO nodes: it drains one node's
+    // outgoing packets and hands each straight to the other node's `hop_bytes_received`, keyed by a
+    // shared link id. That exercises the full inbound+outbound byte seam end to end, exactly as the
+    // real transport would, but without a network or device.
+
+    /// Context a sink writes into: collects (link, bytes) drained from a node.
+    struct DrainCollector {
+        packets: Vec<(u64, Vec<u8>)>,
+    }
+
+    extern "C" fn drain_sink(ctx: *mut c_void, link: u64, bytes: *const u8, len: usize) {
+        unsafe {
+            let c = &mut *(ctx as *mut DrainCollector);
+            c.packets.push((link, slice(bytes, len).to_vec()));
+        }
+    }
+
+    /// Drain every outgoing packet a node has queued, as a host would.
+    unsafe fn drain(node: *const HopNode) -> Vec<(u64, Vec<u8>)> {
+        let mut c = DrainCollector {
+            packets: Vec::new(),
+        };
+        hop_drain_outgoing(node, Some(drain_sink), &mut c as *mut _ as *mut c_void);
+        c.packets
+    }
+
+    /// Pump bytes between two nodes until the wire goes quiet. `link_a` is the link id node A uses
+    /// for this bearer; `link_b` is node B's. Bytes A drains on `link_a` arrive at B on `link_b`,
+    /// and vice-versa. Returns after no node has anything left to send (or a safety cap).
+    unsafe fn pump(a: *const HopNode, link_a: u64, b: *const HopNode, link_b: u64) {
+        for _ in 0..1000 {
+            let mut any = false;
+            for (_l, bytes) in drain(a) {
+                any = true;
+                hop_bytes_received(b, link_b, bytes.as_ptr(), bytes.len());
+            }
+            for (_l, bytes) in drain(b) {
+                any = true;
+                hop_bytes_received(a, link_a, bytes.as_ptr(), bytes.len());
+            }
+            if !any {
+                break;
+            }
+        }
+    }
+
+    /// Bring up a bearer link between two fresh nodes (A dials, B accepts), pump the handshake, and
+    /// gossip prekeys so `hop_send_message` can open a forward-secret session. Returns the two
+    /// addresses. Uses distinct link ids per node so the harness never conflates directions.
+    unsafe fn connect(a: *const HopNode, b: *const HopNode) -> ([u8; 32], [u8; 32]) {
+        const LA: u64 = 11;
+        const LB: u64 = 22;
+        // Give both a real clock so prekey adverts aren't judged expired.
+        hop_node_tick(a, 1_000);
+        hop_node_tick(b, 1_000);
+        hop_link_up(a, LA, HopLinkRole::Dialer as u32);
+        hop_link_up(b, LB, HopLinkRole::Acceptor as u32);
+        pump(a, LA, b, LB);
+        assert!(hop_publish_prekey(a), "A publishes its prekey");
+        assert!(hop_publish_prekey(b), "B publishes its prekey");
+        pump(a, LA, b, LB);
+        let (mut aa, mut ba) = ([0u8; 32], [0u8; 32]);
+        assert!(hop_node_address(a, aa.as_mut_ptr()));
+        assert!(hop_node_address(b, ba.as_mut_ptr()));
+        (aa, ba)
+    }
+
+    /// Inbox collector for `hop_poll_inbox`.
+    struct InboxCollector {
+        msgs: Vec<(Vec<u8>, String, Vec<u8>, u8)>,
+    }
+    extern "C" fn inbox_sink(
+        ctx: *mut c_void,
+        from: *const u8,
+        content_type: *const c_char,
+        body: *const u8,
+        body_len: usize,
+        hops: u8,
+        _created_at: u64,
+    ) {
+        unsafe {
+            let c = &mut *(ctx as *mut InboxCollector);
+            let ct = CStr::from_ptr(content_type).to_string_lossy().into_owned();
+            c.msgs.push((
+                slice(from, 32).to_vec(),
+                ct,
+                slice(body, body_len).to_vec(),
+                hops,
+            ));
+        }
+    }
+    unsafe fn poll_inbox(node: *const HopNode) -> Vec<(Vec<u8>, String, Vec<u8>, u8)> {
+        let mut c = InboxCollector { msgs: Vec::new() };
+        hop_poll_inbox(node, Some(inbox_sink), &mut c as *mut _ as *mut c_void);
+        c.msgs
+    }
+
+    #[test]
+    fn node_open_persists_and_restores_the_same_identity_from_disk() {
+        // hop_node_open is the disk-backed ctor a real host uses. Prove it (a) returns a persistent
+        // node, (b) survives a free + reopen at the same path, restoring the SAME identity from the
+        // saved secret, all through the C string / raw-pointer surface. NULL/non-UTF-8 path -> NULL.
+        unsafe {
+            // NULL path is rejected with a NULL handle (documented sentinel), not a crash.
+            assert!(
+                hop_node_open(std::ptr::null(), std::ptr::null(), 0, std::ptr::null(), 0).is_null()
+            );
+
+            let dir = std::env::temp_dir().join(format!("hop-abi-open-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let db = dir.join("node.db");
+            let c_path = std::ffi::CString::new(db.to_str().unwrap()).unwrap();
+
+            let n1 = hop_node_open(c_path.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0);
+            assert!(!n1.is_null(), "open returns a handle");
+            assert!(
+                hop_node_is_persistent(n1),
+                "a real db path is persistent storage"
+            );
+            let mut addr1 = [0u8; 32];
+            assert!(hop_node_address(n1, addr1.as_mut_ptr()));
+            let mut secret = [0u8; 32];
+            assert_eq!(hop_node_secret(n1, secret.as_mut_ptr()), 32);
+            hop_node_free(n1);
+
+            // Reopen the SAME path with the saved secret: identity must be restored.
+            let n2 = hop_node_open(
+                c_path.as_ptr(),
+                secret.as_ptr(),
+                secret.len(),
+                std::ptr::null(),
+                0,
+            );
+            assert!(!n2.is_null());
+            let mut addr2 = [0u8; 32];
+            assert!(hop_node_address(n2, addr2.as_mut_ptr()));
+            assert_eq!(addr1, addr2, "identity restored from the persisted secret");
+            assert_eq!(
+                hop_node_rehydrate_dropped(n2),
+                0,
+                "a clean reopen drops no persisted records"
+            );
+            hop_node_free(n2);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn node_open_keyed_encrypts_at_rest_and_still_round_trips_identity() {
+        // hop_node_open_keyed is the SQLCipher-at-rest ctor (F-25): same identity guarantees as
+        // hop_node_open, plus a raw key. Prove the keyed open yields a persistent node whose identity
+        // round-trips across a reopen with the same key. NULL path -> NULL sentinel.
+        unsafe {
+            assert!(hop_node_open_keyed(
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0
+            )
+            .is_null());
+
+            let dir = std::env::temp_dir().join(format!("hop-abi-keyed-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let db = dir.join("node.db");
+            let c_path = std::ffi::CString::new(db.to_str().unwrap()).unwrap();
+            let key = [0x5Au8; 32];
+            let secret = [3u8; 32];
+
+            let n1 = hop_node_open_keyed(
+                c_path.as_ptr(),
+                secret.as_ptr(),
+                secret.len(),
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                key.len(),
+            );
+            assert!(!n1.is_null());
+            assert!(hop_node_is_persistent(n1));
+            let mut addr1 = [0u8; 32];
+            assert!(hop_node_address(n1, addr1.as_mut_ptr()));
+            hop_node_free(n1);
+
+            let n2 = hop_node_open_keyed(
+                c_path.as_ptr(),
+                secret.as_ptr(),
+                secret.len(),
+                std::ptr::null(),
+                0,
+                key.as_ptr(),
+                key.len(),
+            );
+            assert!(!n2.is_null());
+            let mut addr2 = [0u8; 32];
+            assert!(hop_node_address(n2, addr2.as_mut_ptr()));
+            assert_eq!(addr1, addr2, "keyed reopen restores the same identity");
+            hop_node_free(n2);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn is_secured_flips_true_only_after_a_forward_secret_send_over_the_abi() {
+        // hop_is_secured is the lock indicator the UI shows: true iff a ratchet session exists to the
+        // peer (a real forward-secret conversation), not merely a link. Prove it is false before any
+        // message and flips true once A actually sends a forward-secret message to B through the ABI.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (_aa, ba) = connect(a, b);
+            // A link + gossiped prekeys is NOT yet a session: no lock until a real send.
+            assert!(
+                !hop_is_secured(a, ba.as_ptr()),
+                "not secured until a forward-secret message is sent"
+            );
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"open a session";
+            assert!(hop_send_message(
+                a,
+                ba.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                false,
+                std::ptr::null_mut(),
+            ));
+            assert!(
+                hop_is_secured(a, ba.as_ptr()),
+                "A now holds a ratchet session to B: the lock shows"
+            );
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    #[test]
+    fn send_message_crosses_two_nodes_and_arrives_in_the_peer_inbox() {
+        // The end-to-end reason libhop exists: node A sends, node B receives the plaintext. Drive it
+        // entirely through the C ABI (send + drain + received + poll_inbox) so a regression anywhere
+        // on the byte seam is caught. Assert the delivered from-address, content-type, and body.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (aa, ba) = connect(a, b);
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"hello over the abi";
+            let mut id = [0u8; 32];
+            assert!(
+                hop_send_message(
+                    a,
+                    ba.as_ptr(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    true,
+                    id.as_mut_ptr(),
+                ),
+                "send_message returns true and writes a bundle id"
+            );
+            assert_ne!(id, [0u8; 32], "a real bundle id was written");
+
+            pump(a, 11, b, 22);
+            let inbox = poll_inbox(b);
+            assert_eq!(inbox.len(), 1, "exactly one message arrived at B");
+            let (from, cty, got_body, _hops) = &inbox[0];
+            assert_eq!(from.as_slice(), &aa[..], "from == A's address");
+            assert_eq!(cty, "text/plain");
+            assert_eq!(got_body.as_slice(), &body[..], "body arrives intact");
+
+            // Draining the inbox is destructive: a second poll is empty.
+            assert!(poll_inbox(b).is_empty(), "inbox drained on first poll");
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    #[test]
+    fn message_status_transitions_to_delivered_after_a_private_ack() {
+        // hop_send_message with request_ack asks the recipient for a §39 private delivery
+        // confirmation. Before the ACK returns, message_status reports delivered=false; after the
+        // round trip is pumped, it must flip to delivered=true. This is the send-receipt the UI
+        // shows, driven purely through the ABI.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (_aa, ba) = connect(a, b);
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"ack me";
+            let mut id = [0u8; 32];
+            assert!(hop_send_message(
+                a,
+                ba.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                true,
+                id.as_mut_ptr(),
+            ));
+
+            // Immediately: not yet delivered.
+            let mut delivered = true;
+            assert!(hop_message_status(
+                a,
+                id.as_ptr(),
+                std::ptr::null_mut(),
+                &mut delivered,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ));
+            assert!(!delivered, "not delivered before the ACK round trip");
+
+            // Pump the message to B, let B poll (which triggers the private ACK), pump the ACK back.
+            pump(a, 11, b, 22);
+            let _ = poll_inbox(b);
+            pump(a, 11, b, 22);
+
+            let mut delivered2 = false;
+            let mut hops = 0u8;
+            assert!(hop_message_status(
+                a,
+                id.as_ptr(),
+                std::ptr::null_mut(),
+                &mut delivered2,
+                &mut hops,
+                std::ptr::null_mut(),
+            ));
+            assert!(delivered2, "delivered flips true after the private ACK");
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    // ---- service request/response full round trip (hops://) ----------------------------------
+
+    // (from, request_id, service, method, args)
+    type SvcReqRow = (Vec<u8>, Vec<u8>, String, String, Vec<u8>);
+    // (from, for_request_id, status, body)
+    type SvcRespRow = (Vec<u8>, Vec<u8>, u16, Vec<u8>);
+
+    struct SvcReqCollector {
+        reqs: Vec<SvcReqRow>,
+    }
+    #[allow(clippy::too_many_arguments)]
+    extern "C" fn svc_req_sink(
+        ctx: *mut c_void,
+        from: *const u8,
+        request_id: *const u8,
+        service: *const c_char,
+        method: *const c_char,
+        args: *const u8,
+        args_len: usize,
+    ) {
+        unsafe {
+            let c = &mut *(ctx as *mut SvcReqCollector);
+            c.reqs.push((
+                slice(from, 32).to_vec(),
+                slice(request_id, 32).to_vec(),
+                CStr::from_ptr(service).to_string_lossy().into_owned(),
+                CStr::from_ptr(method).to_string_lossy().into_owned(),
+                slice(args, args_len).to_vec(),
+            ));
+        }
+    }
+    unsafe fn poll_requests(node: *const HopNode) -> Vec<SvcReqRow> {
+        let mut c = SvcReqCollector { reqs: Vec::new() };
+        hop_poll_service_requests(node, Some(svc_req_sink), &mut c as *mut _ as *mut c_void);
+        c.reqs
+    }
+
+    struct SvcRespCollector {
+        resps: Vec<SvcRespRow>,
+    }
+    extern "C" fn svc_resp_sink(
+        ctx: *mut c_void,
+        from: *const u8,
+        for_request_id: *const u8,
+        status: u16,
+        body: *const u8,
+        body_len: usize,
+    ) {
+        unsafe {
+            let c = &mut *(ctx as *mut SvcRespCollector);
+            c.resps.push((
+                slice(from, 32).to_vec(),
+                slice(for_request_id, 32).to_vec(),
+                status,
+                slice(body, body_len).to_vec(),
+            ));
+        }
+    }
+    unsafe fn poll_responses(node: *const HopNode) -> Vec<SvcRespRow> {
+        let mut c = SvcRespCollector { resps: Vec::new() };
+        hop_poll_service_responses(node, Some(svc_resp_sink), &mut c as *mut _ as *mut c_void);
+        c.resps
+    }
+
+    #[test]
+    fn hops_service_request_response_round_trips_through_the_abi() {
+        // The full hops:// round trip that makes an ESP32 a real client: caller A fires a service
+        // request; host B drains it, seals a response; caller A drains the response. Assert the ids
+        // line up (response.for_request_id == request.request_id), the service/method/args survive,
+        // and the status + body come back. All through the extern "C" surface.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (aa, ba) = connect(a, b);
+
+            let service = std::ffi::CString::new("weather").unwrap();
+            let method = std::ffi::CString::new("report").unwrap();
+            let args = b"temp=21";
+            let mut req_id = [0u8; 32];
+            assert!(
+                hop_send_service_request(
+                    a,
+                    ba.as_ptr(),
+                    service.as_ptr(),
+                    method.as_ptr(),
+                    args.as_ptr(),
+                    args.len(),
+                    req_id.as_mut_ptr(),
+                ),
+                "service request fires and writes a request id"
+            );
+            assert_ne!(req_id, [0u8; 32]);
+
+            pump(a, 11, b, 22);
+            let reqs = poll_requests(b);
+            assert_eq!(reqs.len(), 1, "B drains exactly one request");
+            let (from, got_req_id, svc, mth, got_args) = &reqs[0];
+            assert_eq!(from.as_slice(), &aa[..], "request came from A");
+            assert_eq!(got_req_id.as_slice(), &req_id[..], "request id matches");
+            assert_eq!(svc, "weather");
+            assert_eq!(mth, "report");
+            assert_eq!(got_args.as_slice(), &args[..], "args survive the codec");
+
+            // B seals a response back.
+            let resp_body = b"stored";
+            assert!(
+                hop_send_service_response(
+                    b,
+                    from.as_ptr(),
+                    got_req_id.as_ptr(),
+                    200,
+                    resp_body.as_ptr(),
+                    resp_body.len(),
+                ),
+                "response seals and queues"
+            );
+            pump(a, 11, b, 22);
+
+            let resps = poll_responses(a);
+            assert_eq!(resps.len(), 1, "A drains exactly one response");
+            let (rfrom, for_id, status, body) = &resps[0];
+            assert_eq!(rfrom.as_slice(), &ba[..], "response came from B");
+            assert_eq!(
+                for_id.as_slice(),
+                &req_id[..],
+                "for_request_id ties the response to the original request"
+            );
+            assert_eq!(*status, 200u16, "status code round-trips");
+            assert_eq!(body.as_slice(), &resp_body[..], "response body round-trips");
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    // ---- base58 address codec ----------------------------------------------------------------
+
+    #[test]
+    fn base58_address_round_trips_and_rejects_garbage() {
+        unsafe {
+            // A node's real address must survive encode -> decode unchanged.
+            let node = hop_node_new();
+            let mut addr = [0u8; 32];
+            assert!(hop_node_address(node, addr.as_mut_ptr()));
+
+            let mut buf = [0i8; 64];
+            let n = hop_address_to_base58(addr.as_ptr(), buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "encoded to a non-empty base58 string");
+            // NUL-terminated at the reported length.
+            assert_eq!(buf[n], 0, "output is NUL-terminated at the reported length");
+
+            let mut decoded = [0u8; 32];
+            assert!(hop_address_from_base58(buf.as_ptr(), decoded.as_mut_ptr()));
+            assert_eq!(decoded, addr, "base58 round-trips the address exactly");
+
+            // Too-small buffer must refuse (return 0), not overflow.
+            let mut tiny = [0i8; 4];
+            assert_eq!(
+                hop_address_to_base58(addr.as_ptr(), tiny.as_mut_ptr(), tiny.len()),
+                0,
+                "insufficient capacity returns 0, never overruns"
+            );
+
+            // Non-base58 / wrong-length garbage must be rejected.
+            let bad = std::ffi::CString::new("0OIl+not+base58").unwrap();
+            assert!(
+                !hop_address_from_base58(bad.as_ptr(), decoded.as_mut_ptr()),
+                "invalid base58 is rejected"
+            );
+            let short = std::ffi::CString::new("aaa").unwrap(); // decodes to < 32 bytes
+            assert!(
+                !hop_address_from_base58(short.as_ptr(), decoded.as_mut_ptr()),
+                "a valid-base58 but wrong-length string is rejected"
+            );
+
+            // NULL inputs are handled without UB.
+            assert_eq!(
+                hop_address_to_base58(std::ptr::null(), buf.as_mut_ptr(), buf.len()),
+                0
+            );
+            assert!(!hop_address_from_base58(
+                std::ptr::null(),
+                decoded.as_mut_ptr()
+            ));
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn link_down_ends_the_directed_send_path() {
+        // hop_send_to (the directed §27 path) only works to a peer we're DIRECTLY linked to. Prove
+        // it succeeds while the link is up, then that hop_link_down removes the peer link so the very
+        // same send now returns a clean false. Drives link_up + link_down through the ABI.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (_aa, ba) = connect(a, b);
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"x";
+            assert!(
+                hop_send_to(
+                    a,
+                    ba.as_ptr(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    false,
+                    std::ptr::null_mut(),
+                ),
+                "send_to a directly-linked peer succeeds while the link is up"
+            );
+
+            hop_link_down(a, 11);
+            // No live peer link remains, so a directed send_to must now fail cleanly.
+            assert!(
+                !hop_send_to(
+                    a,
+                    ba.as_ptr(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    false,
+                    std::ptr::null_mut(),
+                ),
+                "send_to a peer whose link dropped is a clean false"
+            );
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    #[test]
+    fn send_to_directly_connected_peer_delivers() {
+        // hop_send_to is the directed §27 path: it only works to a peer we're directly linked to.
+        // Prove it succeeds across a live ABI link and the message lands in the peer's inbox.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            let (aa, ba) = connect(a, b);
+
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let body = b"directed hello";
+            let mut id = [0u8; 32];
+            assert!(
+                hop_send_to(
+                    a,
+                    ba.as_ptr(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    false,
+                    id.as_mut_ptr(),
+                ),
+                "send_to a directly-connected peer succeeds"
+            );
+            assert_ne!(id, [0u8; 32]);
+            pump(a, 11, b, 22);
+            let inbox = poll_inbox(b);
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].0.as_slice(), &aa[..]);
+            assert_eq!(inbox[0].2.as_slice(), &body[..]);
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
+    #[test]
+    fn garbage_bytes_on_a_link_are_swallowed_not_unwound() {
+        // hop_bytes_received is the single most hostile entry: it takes raw network bytes. Feeding
+        // random garbage on an up link (and on a link that was never brought up) must never panic or
+        // unwind across the ABI, and must leave the node still usable afterwards.
+        unsafe {
+            let node = hop_node_new();
+            hop_link_up(node, 5, HopLinkRole::Acceptor as u32);
+            let junk = [0xABu8; 128];
+            hop_bytes_received(node, 5, junk.as_ptr(), junk.len());
+            // A never-up link id, too.
+            hop_bytes_received(node, 999, junk.as_ptr(), junk.len());
+            // Zero-length frame.
+            hop_bytes_received(node, 5, std::ptr::null(), 0);
+
+            // The node still answers accessors afterwards: no brick, no poisoned lock.
+            let mut addr = [0u8; 32];
+            assert!(
+                hop_node_address(node, addr.as_mut_ptr()),
+                "node still usable after hostile bytes"
+            );
+            assert_ne!(addr, [0u8; 32]);
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn null_and_garbage_inputs_return_sentinels_across_the_send_surface() {
+        // Every send/query entry point must reject NULL node / NULL required pointers with its
+        // documented sentinel (false / 0), never dereference NULL, never unwind.
+        unsafe {
+            let ct = std::ffi::CString::new("text/plain").unwrap();
+            let dst = [1u8; 32];
+            let body = b"x";
+            // NULL node on each send path.
+            assert!(!hop_send_message(
+                std::ptr::null(),
+                dst.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                false,
+                std::ptr::null_mut()
+            ));
+            assert!(!hop_send_to(
+                std::ptr::null(),
+                dst.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                false,
+                std::ptr::null_mut()
+            ));
+            assert!(!hop_publish_prekey(std::ptr::null()));
+            assert!(!hop_is_secured(std::ptr::null(), dst.as_ptr()));
+            assert!(!hop_message_status(
+                std::ptr::null(),
+                dst.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ));
+
+            // Live node, but NULL required pointers -> documented false, no deref.
+            let node = hop_node_new();
+            assert!(
+                !hop_send_message(
+                    node,
+                    std::ptr::null(),
+                    ct.as_ptr(),
+                    body.as_ptr(),
+                    body.len(),
+                    false,
+                    std::ptr::null_mut()
+                ),
+                "NULL dst rejected"
+            );
+            assert!(
+                !hop_send_message(
+                    node,
+                    dst.as_ptr(),
+                    std::ptr::null(),
+                    body.as_ptr(),
+                    body.len(),
+                    false,
+                    std::ptr::null_mut()
+                ),
+                "NULL content_type rejected"
+            );
+            assert!(
+                !hop_is_secured(node, std::ptr::null()),
+                "NULL addr rejected"
+            );
+            assert!(
+                !hop_message_status(
+                    node,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                "NULL id rejected"
+            );
+            assert!(
+                !hop_send_service_request(
+                    node,
+                    std::ptr::null(),
+                    ct.as_ptr(),
+                    ct.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                "NULL dst on service request rejected"
+            );
+            assert!(
+                !hop_send_service_response(
+                    node,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    200,
+                    std::ptr::null(),
+                    0
+                ),
+                "NULL to/request_id on service response rejected"
+            );
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn drain_and_poll_are_noops_with_a_null_sink_or_null_node() {
+        // The poll-model drains must tolerate a NULL sink and a NULL node without UB (a host that
+        // passes a bad callback, or drains a node that failed to open).
+        unsafe {
+            let node = hop_node_new();
+            hop_drain_outgoing(node, None, std::ptr::null_mut());
+            hop_poll_inbox(node, None, std::ptr::null_mut());
+            hop_poll_service_requests(node, None, std::ptr::null_mut());
+            hop_poll_service_responses(node, None, std::ptr::null_mut());
+            // NULL node with a real-looking sink is also safe.
+            hop_drain_outgoing(std::ptr::null(), Some(drain_sink), std::ptr::null_mut());
+            // Node still fine.
+            let mut addr = [0u8; 32];
+            assert!(hop_node_address(node, addr.as_mut_ptr()));
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn subscribe_and_set_name_are_tolerant_and_effect_free_of_panics() {
+        // These unit-returning entry points have no return to assert, so drive their observable
+        // safety: NULL node, NULL string, and a valid call must all run without unwinding, and the
+        // node must remain usable (subscribe/set_name touch node state under the lock).
+        unsafe {
+            let topic = std::ffi::CString::new("hops.chat").unwrap();
+            let name = std::ffi::CString::new("esp32-01").unwrap();
+            // NULL node: no-op.
+            hop_subscribe(std::ptr::null(), topic.as_ptr());
+            hop_node_set_name(std::ptr::null(), name.as_ptr());
+
+            let node = hop_node_new();
+            // NULL string args: no-op, no deref.
+            hop_subscribe(node, std::ptr::null());
+            hop_node_set_name(node, std::ptr::null());
+            // Valid calls run clean.
+            hop_subscribe(node, topic.as_ptr());
+            hop_node_set_name(node, name.as_ptr());
+            // Node still answers after mutating its state under the lock.
+            let mut addr = [0u8; 32];
+            assert!(hop_node_address(node, addr.as_mut_ptr()));
+            assert_ne!(addr, [0u8; 32]);
+            hop_node_free(node);
+        }
+    }
+
+    #[test]
+    fn link_role_out_of_range_is_treated_as_acceptor_not_ub() {
+        // core-ffi-05: hop_link_up takes role as a plain u32. A C caller passing an out-of-range int
+        // (here 7) must NOT materialize an invalid enum (UB); only 0 selects Dialer, anything else is
+        // Acceptor. Prove a garbage role still yields a working link that completes a handshake.
+        unsafe {
+            let a = hop_node_new();
+            let b = hop_node_new();
+            hop_node_tick(a, 1_000);
+            hop_node_tick(b, 1_000);
+            // A dials (0). B accepts via a GARBAGE role int (7) -> must behave as Acceptor.
+            hop_link_up(a, 11, 0);
+            hop_link_up(b, 22, 7);
+            pump(a, 11, b, 22);
+            assert!(hop_publish_prekey(a));
+            assert!(hop_publish_prekey(b));
+            pump(a, 11, b, 22);
+            let mut ba = [0u8; 32];
+            assert!(hop_node_address(b, ba.as_mut_ptr()));
+            // If the garbage role int had corrupted the handshake, no session forms and this send
+            // never reaches B. Delivery to B's inbox proves the link came up as an Acceptor.
+            let ct = std::ffi::CString::new("t").unwrap();
+            let body = b"role-check";
+            assert!(hop_send_message(
+                a,
+                ba.as_ptr(),
+                ct.as_ptr(),
+                body.as_ptr(),
+                body.len(),
+                false,
+                std::ptr::null_mut(),
+            ));
+            pump(a, 11, b, 22);
+            let inbox = poll_inbox(b);
+            assert_eq!(
+                inbox.len(),
+                1,
+                "garbage role int behaved as Acceptor and the message delivered"
+            );
+            assert_eq!(inbox[0].2.as_slice(), &body[..]);
+            hop_node_free(a);
+            hop_node_free(b);
+        }
+    }
+
     #[test]
     fn wrapped_send_paths_run_clean_on_the_happy_path() {
         // Drive the newly-wrapped fns through a live node to confirm the catch wrapper didn't alter
