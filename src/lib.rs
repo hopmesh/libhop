@@ -1433,6 +1433,109 @@ mod tests {
         );
     }
 
+    // F-25/F-26 (cabi-r3): open_store_persistent chooses among three data-loss-adjacent recovery arms
+    // on a keyed-open failure. The underlying store OPERATIONS are proven in hop-store-sqlite; what was
+    // untested at the FFI layer is the BRANCH SELECTION - which arm fires and whether is_persistent()
+    // reports the truth. Picking wrong loses sessions/prekeys/queued sends or falsely claims durability.
+    // These tests pin each arm.
+    fn recovery_tmp(name: &str) -> String {
+        let p = std::env::temp_dir().join(format!("hop_cabi_r3_{name}_{}.db", std::process::id()));
+        let s = p.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&s);
+        let _ = std::fs::remove_file(format!("{s}.corrupt"));
+        s
+    }
+
+    #[cfg(feature = "sqlcipher")]
+    #[test]
+    fn keyed_open_of_a_plaintext_db_migrates_in_place_and_stays_persistent() {
+        use hop_store_sqlite::SqliteStore;
+        let path = recovery_tmp("migrate");
+        // Start with a PLAINTEXT db (empty key).
+        drop(SqliteStore::open_keyed(&path, &[]).expect("create plaintext db"));
+        assert!(
+            SqliteStore::opens_as_plaintext(&path),
+            "db starts as plaintext"
+        );
+        // Open persistently WITH a key: the migration arm must fire - persistent stays true, the file is
+        // encrypted in place, nothing is quarantined, and the key reopens it.
+        let key = [7u8; 32];
+        let (_s, persistent) = open_store_persistent(&path, &key);
+        assert!(
+            persistent,
+            "migration arm: is_persistent stays true (no false ephemeral)"
+        );
+        assert!(
+            !SqliteStore::opens_as_plaintext(&path),
+            "the db is now SQLCipher-encrypted"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{path}.corrupt")).exists(),
+            "migration must NOT quarantine"
+        );
+        assert!(
+            SqliteStore::open_keyed(&path, &key).is_ok(),
+            "reopens with the migration key"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "sqlcipher")]
+    #[test]
+    fn wrong_key_on_a_keyed_db_fails_closed_and_preserves_the_file() {
+        use hop_store_sqlite::SqliteStore;
+        let path = recovery_tmp("failclosed");
+        let key_a = [1u8; 32];
+        drop(SqliteStore::open_keyed(&path, &key_a).expect("create keyed db"));
+        // Open with the WRONG key: the fail-closed arm must fire - ephemeral (is_persistent=false), the
+        // encrypted file PRESERVED (not wiped, not quarantined), so the right key recovers it later.
+        let key_b = [2u8; 32];
+        let (_s, persistent) = open_store_persistent(&path, &key_b);
+        assert!(
+            !persistent,
+            "wrong key runs ephemeral (is_persistent=false), never churns state"
+        );
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the encrypted file is preserved"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{path}.corrupt")).exists(),
+            "a wrong key must NOT quarantine (a transient wrong key must be recoverable)"
+        );
+        assert!(
+            SqliteStore::open_keyed(&path, &key_a).is_ok(),
+            "the correct key still recovers the db after a wrong-key session"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_plain_db_is_quarantined_and_a_fresh_store_starts() {
+        use hop_store_sqlite::SqliteStore;
+        let path = recovery_tmp("quarantine");
+        let quar = format!("{path}.corrupt");
+        // A genuinely unusable PLAIN db (garbage bytes, no key ambiguity).
+        std::fs::write(&path, b"this is not a sqlite database at all, just garbage").unwrap();
+        // Empty-key path: the quarantine arm must fire - move the bad file aside and start FRESH
+        // persistent (is_persistent=true), leaving a .corrupt copy for forensics.
+        let (_s, persistent) = open_store_persistent(&path, &[]);
+        assert!(
+            persistent,
+            "quarantine-then-fresh keeps persistence (is_persistent=true)"
+        );
+        assert!(
+            std::path::Path::new(&quar).exists(),
+            "the corrupt db was quarantined to .corrupt"
+        );
+        assert!(
+            SqliteStore::opens_as_plaintext(&path),
+            "a fresh usable plain db now lives at the path"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&quar);
+    }
+
     #[test]
     fn two_nodes_handshake_and_message_over_ffi() {
         let a = HopNode::new();
