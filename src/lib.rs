@@ -1572,4 +1572,508 @@ mod tests {
         let err = a.send_message(vec![0u8; 10], "t".into(), vec![], false);
         assert!(matches!(err, Err(FfiError::BadKey)));
     }
+
+    // cov/cabi: the FFI surface below is the UniFFI-exported `HopNode` method body + the free
+    // helpers. cabi.rs proves the C-ABI shims; these prove the Rust methods those shims (and the
+    // Swift/Kotlin bindings) call - every error/return branch, each type mapper, and the drains
+    // that only populate their record mappers when a real message crosses. Untested here before,
+    // so a regression in a mapper (wrong field, dropped variant) surfaced only on-device.
+
+    /// Handshake two nodes over one symmetric link (id 1) WITHOUT gossiping prekeys. Enough for
+    /// hps/http/service sends (they seal to a static address); only §39 `send_message` needs a
+    /// ratchet. Mirrors hop-core's `Wire2::connect` (handshake only).
+    fn link(a: &HopNode, b: &HopNode) {
+        a.tick(1_000);
+        b.tick(1_000);
+        a.connected(1, true);
+        b.connected(1, false);
+        pump(a, b);
+    }
+
+    #[test]
+    fn free_functions_and_type_mappers_round_trip() {
+        // base58 address: encode -> decode round trip; invalid input decodes to empty.
+        let addr = HopNode::new().address();
+        let b58 = address_base58(addr.clone());
+        assert!(!b58.is_empty());
+        assert_eq!(address_from_base58(b58), addr);
+        assert!(address_from_base58("!!!not base58!!!".into()).is_empty());
+
+        // short_address: 32-byte -> 8-byte short form; a wrong-length address -> empty.
+        assert_eq!(short_address(addr).len(), 8);
+        assert!(short_address(vec![0u8; 10]).is_empty());
+
+        // service_identify is the built-in identity service name.
+        assert_eq!(service_identify(), "hop.identify");
+
+        // hex8 renders 8 bytes as 16 lowercase hex chars.
+        assert_eq!(hex8(&[0x0a, 0xff, 0, 1, 2, 3, 4, 5]), "0aff000102030405");
+
+        // label_app: relay app -> "Hop Relay", fabric app -> "device", anything else -> hex.
+        assert_eq!(label_app(&short_app(&relay_app_id())), "Hop Relay");
+        assert_eq!(label_app(&short_app(&FABRIC_APP)), "device");
+        let other = label_app(&short_app(&app_id("com.example.other")));
+        assert_eq!(other.len(), 16, "an unknown app renders as 8-byte hex");
+        assert_ne!(other, "Hop Relay");
+        assert_ne!(other, "device");
+
+        // identity_from: a valid 32-byte secret is deterministic; a wrong-length one falls back to
+        // a fresh identity (both arms exercised).
+        let s = [9u8; 32];
+        assert_eq!(identity_from(&s).address(), identity_from(&s).address());
+        let _ = identity_from(&[1, 2, 3]);
+
+        // hps enum <-> core mappers, both directions, every variant.
+        use hop_core::hps::{AccessMode, ServiceKind, Visibility};
+        assert!(matches!(
+            kind_to_core(&HpsKind::Channel),
+            ServiceKind::Channel
+        ));
+        assert!(matches!(
+            kind_to_core(&HpsKind::Service),
+            ServiceKind::Service
+        ));
+        assert!(matches!(
+            kind_from_core(ServiceKind::Channel),
+            HpsKind::Channel
+        ));
+        assert!(matches!(
+            kind_from_core(ServiceKind::Service),
+            HpsKind::Service
+        ));
+        assert!(matches!(access_to_core(&HpsAccess::Open), AccessMode::Open));
+        assert!(matches!(
+            access_to_core(&HpsAccess::RequestToJoin),
+            AccessMode::RequestToJoin
+        ));
+        assert!(matches!(
+            access_to_core(&HpsAccess::Invite),
+            AccessMode::Invite
+        ));
+        assert!(matches!(
+            access_from_core(AccessMode::Open),
+            HpsAccess::Open
+        ));
+        assert!(matches!(
+            access_from_core(AccessMode::RequestToJoin),
+            HpsAccess::RequestToJoin
+        ));
+        assert!(matches!(
+            access_from_core(AccessMode::Invite),
+            HpsAccess::Invite
+        ));
+        assert!(matches!(
+            vis_to_core(&HpsVisibility::Private),
+            Visibility::Private
+        ));
+        assert!(matches!(
+            vis_to_core(&HpsVisibility::Discoverable),
+            Visibility::Discoverable
+        ));
+
+        // decode_identity rejects bytes that aren't a valid identity record.
+        assert!(decode_identity(vec![0xff, 0xff, 0xff]).is_none());
+    }
+
+    #[test]
+    fn node_scalar_getters_error_paths_and_local_mutators() {
+        // One app-scoped node drives the whole scalar/host-side surface. `peer` is a real 32-byte
+        // address for the "good key" arms so seals to it never fail on an invalid curve point.
+        let node = HopNode::open(":memory:".into(), Vec::new(), vec![7u8; 32]);
+        let peer = HopNode::new().address();
+
+        // send_message_traced: wrong-length dst -> BadKey; good dst -> Ok(id) (defers, no prekey).
+        assert!(matches!(
+            node.send_message_traced(vec![0u8; 10], "t".into(), vec![], false),
+            Err(FfiError::BadKey)
+        ));
+        let tid = node
+            .send_message_traced(peer.clone(), "text/plain".into(), b"hi".to_vec(), false)
+            .unwrap();
+        assert_eq!(tid.len(), 32);
+
+        // publish_service + browse: our own advert is browsable; the tag-filter branch runs too.
+        node.publish_service(
+            "presence".into(),
+            "Alice".into(),
+            "here".into(),
+            vec!["tag1".into()],
+            60_000,
+        )
+        .unwrap();
+        let hits = node.browse("presence".into(), String::new());
+        assert!(
+            hits.iter()
+                .any(|h| h.service == "presence" && h.title == "Alice"),
+            "own service advert is browsable"
+        );
+        let _ = node.browse("presence".into(), "tag1".into());
+
+        // message_status: a wrong-length id -> blank; the just-sent traced id -> tracked/undelivered.
+        let blank = node.message_status(vec![1u8; 10]);
+        assert!(!blank.delivered && blank.relayed == 0);
+        assert!(!node.message_status(tid).delivered);
+
+        // is_secured / knows_route: wrong-length -> false; an unknown-but-valid key -> false.
+        assert!(!node.is_secured(vec![0u8; 10]));
+        assert!(!node.is_secured(peer.clone()));
+        assert!(!node.knows_route(vec![0u8; 10]));
+        assert!(!node.knows_route(peer.clone()));
+
+        // peers / peer_links empty on an unconnected node; pending_count runs.
+        assert!(node.peers().is_empty());
+        assert!(node.peer_links().is_empty());
+        let _ = node.pending_count();
+
+        // send_hops_request: wrong-length endpoint -> BadKey; good -> Ok(id).
+        assert!(matches!(
+            node.send_hops_request(
+                vec![0u8; 10],
+                "h".into(),
+                "GET".into(),
+                "/".into(),
+                vec![],
+                1000
+            ),
+            Err(FfiError::BadKey)
+        ));
+        node.send_hops_request(
+            peer.clone(),
+            "example.com".into(),
+            "GET".into(),
+            "/x".into(),
+            vec![],
+            64_000,
+        )
+        .unwrap();
+
+        // queue / clear_queue: the hops request above is an own (pinned) Device-addressed bundle in
+        // the store, so it surfaces in the queue with a non-empty destination (queue record mapper).
+        let q = node.queue();
+        assert!(
+            q.iter().any(|i| i.own && !i.to.is_empty()),
+            "our own queued bundle is pinned"
+        );
+        node.clear_queue();
+        assert!(
+            node.queue().is_empty(),
+            "clear_queue drops our undelivered bundles"
+        );
+
+        // resolve_hns_via: wrong-length resolver -> BadKey; good -> Ok(id).
+        assert!(matches!(
+            node.resolve_hns_via(vec![0u8; 10], "d.com".into()),
+            Err(FfiError::BadKey)
+        ));
+        node.resolve_hns_via(peer.clone(), "d.com".into()).unwrap();
+
+        // register_service: a Channel has no service pubkey; a Service exposes one. Covers the
+        // kind/access/visibility -> core mappers across variants (incl. the Discoverable advert).
+        assert!(
+            node.register_service(
+                "room".into(),
+                HpsKind::Channel,
+                HpsAccess::Open,
+                HpsVisibility::Private,
+            )
+            .is_empty(),
+            "a channel has no service pubkey"
+        );
+        assert!(
+            !node
+                .register_service(
+                    "feed".into(),
+                    HpsKind::Service,
+                    HpsAccess::RequestToJoin,
+                    HpsVisibility::Discoverable,
+                )
+                .is_empty(),
+            "a service exposes its pubkey"
+        );
+
+        // hps_my_topics reflects both hosted topics (record mapper).
+        let mine = node.hps_my_topics();
+        assert!(mine.iter().any(|t| t.path == "room" && t.hosting));
+        assert!(mine.iter().any(|t| t.path == "feed"));
+
+        // invite (we host "room"): wrong-length dest -> BadKey; good -> Ok(id).
+        assert!(matches!(
+            node.hps_invite("room".into(), vec![0u8; 10]),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_invite("room".into(), peer.clone()).unwrap();
+
+        // accept/decline: wrong-length host -> BadKey; a good host sends regardless of a match.
+        assert!(matches!(
+            node.hps_accept_invite(vec![0u8; 10], "room".into()),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_accept_invite(peer.clone(), "room".into()).unwrap();
+        assert!(matches!(
+            node.hps_decline_invite(vec![0u8; 10], "room".into()),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_decline_invite(peer.clone(), "room".into())
+            .unwrap();
+
+        // subscribe: wrong-length host -> BadKey; good -> Ok(id).
+        assert!(matches!(
+            node.hps_subscribe(vec![0u8; 10], "room".into()),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_subscribe(peer.clone(), "room".into()).unwrap();
+
+        // pending/approve/deny (host side): approve/deny reject a wrong-length requester.
+        assert!(node.hps_pending("feed".into()).is_empty());
+        assert!(matches!(
+            node.hps_approve("feed".into(), vec![0u8; 10]),
+            Err(FfiError::BadKey)
+        ));
+        assert!(matches!(
+            node.hps_deny("feed".into(), vec![0u8; 10]),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_deny("feed".into(), peer.clone()).unwrap();
+
+        // reach / members are zero/empty on a just-registered topic.
+        assert_eq!(node.hps_reach("room".into()), 0);
+        assert!(node.hps_members("room".into()).is_empty());
+
+        // rekey: a wrong-length member entry -> BadKey; then both new_path branches (keep / move).
+        assert!(matches!(
+            node.hps_rekey("room".into(), String::new(), vec![vec![0u8; 10]]),
+            Err(FfiError::BadKey)
+        ));
+        node.hps_rekey("room".into(), String::new(), vec![])
+            .unwrap(); // keep-path branch
+        node.hps_rekey("room".into(), "room2".into(), vec![])
+            .unwrap(); // move-path branch
+
+        // publish: to a hosted topic -> Ok; to an unknown path -> Err.
+        node.hps_publish("feed".into(), b"news".to_vec()).unwrap();
+        assert!(node
+            .hps_publish("nonexistent".into(), b"x".to_vec())
+            .is_err());
+
+        // leave a path we host (not a subscription) -> Ok(empty bundle id).
+        assert!(node.hps_leave("feed".into()).unwrap().is_empty());
+
+        // empty drains still exercise their bodies; browse_discoverable runs.
+        assert!(node.take_hps_invites().is_empty());
+        assert!(node.take_hps_messages().is_empty());
+        let _ = node.browse_discoverable();
+
+        // http response: wrong-length `to` or `for_request_id` -> BadKey; good -> Ok(()).
+        assert!(matches!(
+            node.send_http_response(vec![0u8; 10], vec![1u8; 32], 200, vec![]),
+            Err(FfiError::BadKey)
+        ));
+        assert!(matches!(
+            node.send_http_response(peer.clone(), vec![1u8; 10], 200, vec![]),
+            Err(FfiError::BadKey)
+        ));
+        node.send_http_response(peer, vec![1u8; 32], 200, b"ok".to_vec())
+            .unwrap();
+        assert!(node.take_http_requests().is_empty());
+        assert!(node.take_http_responses().is_empty());
+
+        // name: unset -> ""; set -> reflected; cleared -> "".
+        assert_eq!(node.name(), "");
+        node.set_name("alice".into());
+        assert_eq!(node.name(), "alice");
+        node.set_name(String::new());
+        assert_eq!(node.name(), "");
+    }
+
+    #[test]
+    fn hns_resolution_flow_populates_cache_and_results() {
+        let node = HopNode::open(":memory:".into(), Vec::new(), Vec::new());
+
+        // Offline: nothing cached yet, so resolve kicks off a (pending) lookup.
+        assert!(matches!(
+            node.resolve_hns("example.com".into()),
+            HnsLookupResult::Pending
+        ));
+
+        // With internet on, the node resolves itself: the domain surfaces as a DNS lookup.
+        node.set_internet(true);
+        assert!(node.is_internet());
+        assert!(matches!(
+            node.resolve_hns("example.com".into()),
+            HnsLookupResult::Pending
+        ));
+        assert!(
+            node.take_dns_lookups()
+                .iter()
+                .any(|d| d.contains("example.com")),
+            "an internet-connected node queues the DNS lookup itself"
+        );
+
+        // Feed back unvalidatable proof bytes -> a cached negative + a finished (empty) result.
+        node.provide_dns_proof("example.com".into(), vec!["not a real doh body".into()]);
+        let results = node.take_hns_results();
+        assert_eq!(results.len(), 1, "one finished resolution");
+        assert!(results[0].address.is_empty(), "a negative resolution");
+        assert!(
+            node.hns_cache()
+                .iter()
+                .any(|e| e.domain.contains("example.com") && e.address.is_empty()),
+            "the negative is cached and surfaced with an empty address"
+        );
+
+        // Now cached: resolve serves the cached negative straight back.
+        assert!(matches!(
+            node.resolve_hns("example.com".into()),
+            HnsLookupResult::Cached { address } if address.is_empty()
+        ));
+    }
+
+    #[test]
+    fn hps_invite_channel_delivers_and_populates_host_and_member_views() {
+        // Two nodes on the SAME app secret so hps join proofs verify across the link.
+        let a = HopNode::open(":memory:".into(), Vec::new(), vec![6u8; 32]); // host
+        let b = HopNode::open(":memory:".into(), Vec::new(), vec![6u8; 32]); // member
+        link(&a, &b);
+        let b_addr = b.address();
+
+        // Host a Discoverable Invite channel; discoverable so browse_discoverable has something.
+        a.register_service(
+            "vip".into(),
+            HpsKind::Channel,
+            HpsAccess::Invite,
+            HpsVisibility::Discoverable,
+        );
+        pump(&a, &b);
+        pump(&a, &b);
+        assert!(
+            b.browse_discoverable().iter().any(|t| t.path == "vip"),
+            "the member sees the discoverable topic (browse_discoverable mapper)"
+        );
+
+        // Host invites the member; the member drains the invite (invite record mapper).
+        a.hps_invite("vip".into(), b_addr.clone()).unwrap();
+        pump(&a, &b);
+        let invites = b.take_hps_invites();
+        assert_eq!(invites.len(), 1);
+        assert_eq!(invites[0].path, "vip");
+
+        // Member accepts; the host seals keys and records the member.
+        b.hps_accept_invite(a.address(), "vip".into()).unwrap();
+        pump(&a, &b);
+        assert!(
+            a.hps_members("vip".into()).contains(&b_addr),
+            "the accepted member is recorded on the host (members mapper)"
+        );
+
+        // Host publishes; the member receives it (take_hps_messages record mapper).
+        a.hps_publish("vip".into(), b"hello vip".to_vec()).unwrap();
+        pump(&a, &b);
+        let msgs = b.take_hps_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"hello vip");
+
+        // The member's own topic list now includes the followed topic (member-side mapper).
+        assert!(b.hps_my_topics().iter().any(|t| t.path == "vip"));
+        let _ = a.hps_reach("vip".into());
+    }
+
+    #[test]
+    fn hps_request_to_join_approval_keys_the_member() {
+        // The host-approves path (hps_approve's Ok arm + hps_pending's non-empty mapper): a
+        // RequestToJoin topic queues a subscribe request; the member can't read until approved.
+        let a = HopNode::open(":memory:".into(), Vec::new(), vec![8u8; 32]); // host
+        let b = HopNode::open(":memory:".into(), Vec::new(), vec![8u8; 32]); // requester
+        link(&a, &b);
+        let b_addr = b.address();
+
+        a.register_service(
+            "lobby".into(),
+            HpsKind::Channel,
+            HpsAccess::RequestToJoin,
+            HpsVisibility::Private,
+        );
+        b.hps_subscribe(a.address(), "lobby".into()).unwrap();
+        pump(&a, &b);
+
+        // Queued for approval, not auto-keyed.
+        assert!(
+            a.hps_pending("lobby".into()).contains(&b_addr),
+            "the requester is queued pending host approval"
+        );
+
+        // Approve; the host seals the keys, then a publish reaches the now-member.
+        a.hps_approve("lobby".into(), b_addr).unwrap();
+        pump(&a, &b);
+        a.hps_publish("lobby".into(), b"welcome".to_vec()).unwrap();
+        pump(&a, &b);
+        let msgs = b.take_hps_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"welcome");
+    }
+
+    #[test]
+    fn hops_http_request_and_response_drains_populate() {
+        let a = HopNode::new();
+        let b = HopNode::new();
+        link(&a, &b);
+
+        let req_id = a
+            .send_hops_request(
+                b.address(),
+                "example.hopme.sh".into(),
+                "GET".into(),
+                "/hello".into(),
+                vec![],
+                64_000,
+            )
+            .unwrap();
+        pump(&a, &b);
+
+        // Endpoint side: the request surfaces for the operator (take_http_requests mapper).
+        let reqs = b.take_http_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].host, "example.hopme.sh");
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].url, "/hello");
+        let (from, rid) = (reqs[0].from.clone(), reqs[0].request_id.clone());
+
+        b.send_http_response(from, rid, 200, b"world".to_vec())
+            .unwrap();
+        pump(&a, &b);
+
+        // Client side: the response arrives, correlated by id (take_http_responses mapper).
+        let resps = a.take_http_responses();
+        assert_eq!(resps.len(), 1);
+        assert_eq!(resps[0].for_request_id, req_id);
+        assert_eq!(resps[0].status, 200);
+        assert_eq!(resps[0].body, b"world");
+    }
+
+    #[test]
+    fn identify_service_round_trips_and_decodes_to_identity_info() {
+        let a = HopNode::new();
+        let b = HopNode::new();
+        link(&a, &b);
+        // The handshake alone authenticates the peer, so peer views are populated here.
+        assert!(!a.peers().is_empty(), "handshake made B a known peer");
+        assert_eq!(
+            a.peer_links().len(),
+            a.peers().len(),
+            "one live link per authenticated peer (peer_links mapper)"
+        );
+
+        b.set_name("Bob's Phone".into());
+        a.send_service_request(b.address(), service_identify(), String::new(), vec![])
+            .unwrap();
+        pump(&a, &b);
+
+        // The built-in service is auto-answered; nothing surfaces to B's app.
+        assert!(b.take_service_requests().is_empty());
+        let resps = a.take_service_responses();
+        assert_eq!(resps.len(), 1);
+        let info = decode_identity(resps[0].body.clone()).expect("a valid identity record decodes");
+        assert_eq!(info.name, "Bob's Phone");
+        assert_eq!(info.kind, "device");
+        assert_eq!(info.address, b.address());
+    }
 }
