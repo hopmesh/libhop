@@ -25,7 +25,7 @@ hop-store-sqlite = { workspace = true, default-features = false, optional = true
 # OPTIONAL (core-ffi-03): UniFFI scaffolding (the Swift/Kotlin ergonomic layer) is NOT compiled for a
 # constrained target — the `minimal` build exposes ONLY the cbindgen C ABI (`cabi.rs`), which is all an
 # ESP32 / bare-C client needs.
-uniffi = { version = "0.28", optional = true }
+uniffi = { version = "0.32", optional = true }
 thiserror.workspace = true
 bs58 = "0.5"
 postcard.workspace = true
