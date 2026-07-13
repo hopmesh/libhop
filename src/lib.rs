@@ -238,8 +238,8 @@ pub struct HttpResp {
     pub body: Vec<u8>,
 }
 
-/// A finished HNS resolution (DESIGN.md §30). `address` empty = the domain has no
-/// `_hopaddress` record (a resolution error, e.g. `hops://thisdoesnotexist.com`).
+/// A finished HNS resolution (DESIGN.md §30). `address` empty = the domain served no valid
+/// reach record (a resolution error, e.g. `hops://thisdoesnotexist.com`).
 #[cfg_attr(feature = "full", derive(uniffi::Record))]
 pub struct HnsRecord {
     pub domain: String,
@@ -301,8 +301,8 @@ pub enum HnsLookupResult {
     /// A lookup was kicked off; the result arrives via `take_hns_results`. If this device
     /// is internet-connected the host must service `take_dns_lookups`.
     Pending,
-    /// This device has no internet and no resolver was given — call `resolve_hns_via` with a
-    /// known internet-connected peer (e.g. a relay address).
+    /// This device has no internet, so it can't fetch the domain's `/.well-known/hop`, and there
+    /// is no relayed resolution. Hand it the address directly instead (`hops://<address>`).
     NeedsResolver,
 }
 
@@ -1007,34 +1007,18 @@ impl HopNode {
         }
     }
 
-    /// Resolve `domain` by asking a known internet-connected peer (e.g. a relay) over the
-    /// mesh. The answer arrives via `take_hns_results`. Returns the query bundle id.
-    pub fn resolve_hns_via(
-        &self,
-        resolver: Vec<u8>,
-        domain: String,
-    ) -> std::result::Result<Vec<u8>, FfiError> {
-        let r = to32(&resolver)?;
-        let id = self
-            .node()
-            .resolve_hns_via(r, &domain)
-            .map_err(|e| FfiError::Hop(e.to_string()))?;
-        Ok(id.to_vec())
-    }
-
-    /// Domains the node needs the host to resolve (DESIGN.md §30). For each, fetch the full
-    /// DNSSEC chain over DoH — the `_hopaddress.<domain>` TXT (`type=16`) plus, for every zone
-    /// from the domain up to the root, DNSKEY (`type=48`) and DS (`type=43`) — all with `do=1`,
-    /// then hand the raw response bodies to `provide_dns_proof`. Core validates; the host never
-    /// decides the address.
+    /// Domains the node needs the host to resolve (DESIGN.md §30). For each, do a plain HTTPS GET
+    /// of `https://<domain>/.well-known/hop` (the TLS certificate proves the domain), pull the
+    /// reach record out of that JSON body, and hand its bytes to `provide_reach_record`. Core
+    /// verifies the reach record against the address it carries; the host never decides the address.
     pub fn take_dns_lookups(&self) -> Vec<String> {
         self.node().take_dns_lookups()
     }
 
-    /// Feed back the raw DoH response bodies for a domain's chain. Core validates the DNSSEC
-    /// chain to the root anchors and caches the address only if it verifies (DESIGN.md §30).
-    pub fn provide_dns_proof(&self, domain: String, bodies: Vec<String>) {
-        self.node().provide_dns_proof(&domain, bodies);
+    /// Feed back the reach-record bytes fetched from a domain's `/.well-known/hop`. Core verifies
+    /// the self-certifying record and caches the address only if it verifies (DESIGN.md §30).
+    pub fn provide_reach_record(&self, domain: String, record: Vec<u8>) {
+        self.node().provide_reach_record(&domain, record);
     }
 
     /// A snapshot of the live HNS cache (for the debug view): each cached domain, its address
@@ -1806,13 +1790,6 @@ mod tests {
             "clear_queue drops our undelivered bundles"
         );
 
-        // resolve_hns_via: wrong-length resolver -> BadKey; good -> Ok(id).
-        assert!(matches!(
-            node.resolve_hns_via(vec![0u8; 10], "d.com".into()),
-            Err(FfiError::BadKey)
-        ));
-        node.resolve_hns_via(peer.clone(), "d.com".into()).unwrap();
-
         // register_service: a Channel has no service pubkey; a Service exposes one. Covers the
         // kind/access/visibility -> core mappers across variants (incl. the Discoverable advert).
         assert!(
@@ -1935,10 +1912,11 @@ mod tests {
     fn hns_resolution_flow_populates_cache_and_results() {
         let node = HopNode::open(":memory:".into(), Vec::new(), Vec::new());
 
-        // Offline: nothing cached yet, so resolve kicks off a (pending) lookup.
+        // Offline: reach records are fetched over the domain's own TLS well-known, which only this
+        // device can do, so with no internet resolution can't start yet -> NeedsResolver.
         assert!(matches!(
             node.resolve_hns("example.com".into()),
-            HnsLookupResult::Pending
+            HnsLookupResult::NeedsResolver
         ));
 
         // With internet on, the node resolves itself: the domain surfaces as a DNS lookup.
@@ -1955,8 +1933,8 @@ mod tests {
             "an internet-connected node queues the DNS lookup itself"
         );
 
-        // Feed back unvalidatable proof bytes -> a cached negative + a finished (empty) result.
-        node.provide_dns_proof("example.com".into(), vec!["not a real doh body".into()]);
+        // Feed back unverifiable reach-record bytes -> a cached negative + a finished (empty) result.
+        node.provide_reach_record("example.com".into(), vec![0u8; 8]);
         let results = node.take_hns_results();
         assert_eq!(results.len(), 1, "one finished resolution");
         assert!(results[0].address.is_empty(), "a negative resolution");
