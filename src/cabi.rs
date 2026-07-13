@@ -43,6 +43,21 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     }
     CStr::from_ptr(p).to_str().ok()
 }
+
+/// Build a NUL-terminated C string for a sink callback, STRIPPING any interior NUL bytes rather than
+/// collapsing the whole value to empty (audit LOW: the sinks used `CString::new(s).unwrap_or_default()`,
+/// which on an interior NUL silently dropped the entire content-type / service / method / endpoint to
+/// `""`). None of those fields legitimately contains a NUL, so filtering is lossless for valid input and
+/// preserves as much as possible for a hostile one, instead of a silent total loss.
+fn c_string_lossy(s: String) -> std::ffi::CString {
+    match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        Err(e) => {
+            let filtered: Vec<u8> = e.into_vec().into_iter().filter(|&b| b != 0).collect();
+            std::ffi::CString::new(filtered).unwrap_or_default()
+        }
+    }
+}
 unsafe fn slice<'a>(p: *const u8, len: usize) -> &'a [u8] {
     if p.is_null() || len == 0 {
         &[]
@@ -339,7 +354,7 @@ pub unsafe extern "C" fn hop_poll_inbox(
     };
     let inbox = catch(Vec::new(), || node.take_inbox());
     for m in inbox {
-        let ct = std::ffi::CString::new(m.content_type).unwrap_or_default();
+        let ct = c_string_lossy(m.content_type);
         sink(
             ctx,
             m.from.as_ptr(),
@@ -540,8 +555,8 @@ pub unsafe extern "C" fn hop_poll_service_requests(
     // sink is a foreign fn: if IT panics that is the host's contract, outside our reach).
     let requests = catch(Vec::new(), || node.take_service_requests());
     for r in requests {
-        let svc = std::ffi::CString::new(r.service).unwrap_or_default();
-        let mth = std::ffi::CString::new(r.method).unwrap_or_default();
+        let svc = c_string_lossy(r.service);
+        let mth = c_string_lossy(r.method);
         sink(
             ctx,
             r.from.as_ptr(),
@@ -720,7 +735,7 @@ pub unsafe extern "C" fn hop_verify_reach_record(
     match rec {
         Some(r) => {
             if let Some(sink) = sink {
-                let ep = std::ffi::CString::new(r.claim.endpoint).unwrap_or_default();
+                let ep = c_string_lossy(r.claim.endpoint);
                 sink(
                     ctx,
                     r.claim.address.as_ptr(),
@@ -742,6 +757,22 @@ mod tests {
     //! way a C/Swift/Kotlin host does - through raw pointers - so a regression in the ABI seam itself
     //! (not just the Rust core) is caught here rather than only on-device.
     use super::*;
+
+    #[test]
+    fn c_string_lossy_strips_interior_nuls_instead_of_emptying() {
+        // audit LOW: a value with an interior NUL must be preserved (minus the NUL), not silently
+        // collapsed to "" the way CString::new(..).unwrap_or_default() did.
+        assert_eq!(
+            c_string_lossy("text/plain".into()).to_bytes(),
+            b"text/plain"
+        );
+        assert_eq!(
+            c_string_lossy("a\0b\0c".into()).to_bytes(),
+            b"abc",
+            "interior NULs are stripped, not emptied"
+        );
+        assert_eq!(c_string_lossy(String::new()).to_bytes(), b"");
+    }
 
     #[test]
     fn abi_version_matches_the_constant() {
