@@ -14,7 +14,7 @@
 // function. A wrapper should assert `hop_abi_version() == HOP_ABI_VERSION` at load so a wrapper
 // built against a newer header fails loudly instead of drifting silently (F-28). This is the
 // *ABI* version and is independent of the *wire* format version (bundle.rs `BUNDLE_VERSION`).
-#define HOP_ABI_VERSION 2
+#define HOP_ABI_VERSION 3
 
 // Which side opened a bearer link (the Noise role). Mirrors hop-core's internal `Role`.
 typedef enum HopLinkRole {
@@ -233,6 +233,29 @@ bool hop_send_message(const struct HopNode *node,
                       uintptr_t body_len,
                       bool request_ack,
                       uint8_t *out_id);
+
+// Sign a self-certifying reachability record for THIS node's address, binding it to `endpoint`
+// (UTF-8 C string, e.g. "wss://myaddress.com/_hop") for `ttl_secs`. Invokes `sink(ctx, bytes, len)`
+// once with the signed record bytes (serve at /.well-known/hop or gossip). No-op on NULL args.
+void hop_sign_reach_record(const struct HopNode *node,
+                           const char *endpoint,
+                           uint32_t ttl_secs,
+                           void (*sink)(void *ctx, const uint8_t *bytes, uintptr_t len),
+                           void *ctx);
+
+// Verify a reachability record. `now_secs` = current Unix time to enforce expiry (0 skips the expiry
+// check). Returns true iff valid; on a valid record invokes `sink(ctx, address32, endpoint_cstr,
+// issued_at, ttl_secs)` once. Self-certifying: the record is checked against the address it names,
+// no external anchor. `bytes`/`len` is the record from `hop_sign_reach_record`.
+bool hop_verify_reach_record(const uint8_t *bytes,
+                             uintptr_t len,
+                             uint64_t now_secs,
+                             void (*sink)(void *ctx,
+                                          const uint8_t *address,
+                                          const char *endpoint,
+                                          uint64_t issued_at,
+                                          uint32_t ttl_secs),
+                             void *ctx);
 
 #ifdef __cplusplus
 }  // extern "C"

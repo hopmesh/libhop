@@ -57,7 +57,7 @@ unsafe fn slice<'a>(p: *const u8, len: usize) -> &'a [u8] {
 /// function. A wrapper should assert `hop_abi_version() == HOP_ABI_VERSION` at load so a wrapper
 /// built against a newer header fails loudly instead of drifting silently (F-28). This is the
 /// *ABI* version and is independent of the *wire* format version (bundle.rs `BUNDLE_VERSION`).
-pub const HOP_ABI_VERSION: u32 = 2;
+pub const HOP_ABI_VERSION: u32 = 3;
 
 /// Returns the ABI version this shared library implements (see [`HOP_ABI_VERSION`]).
 #[no_mangle]
@@ -669,6 +669,70 @@ pub unsafe extern "C" fn hop_send_message(
             Err(_) => false,
         }
     })
+}
+
+// ---- reachability records: self-certifying endpoint discovery (DESIGN.md §30) ----------------
+
+/// Sign a self-certifying reachability record for THIS node's address, binding it to `endpoint`
+/// (UTF-8 C string, e.g. "wss://myaddress.com/_hop") for `ttl_secs`. Invokes `sink(ctx, bytes, len)`
+/// once with the signed record bytes (serve at /.well-known/hop or gossip). No-op on NULL args.
+#[no_mangle]
+pub unsafe extern "C" fn hop_sign_reach_record(
+    node: *const HopNode,
+    endpoint: *const c_char,
+    ttl_secs: u32,
+    sink: Option<extern "C" fn(ctx: *mut c_void, bytes: *const u8, len: usize)>,
+    ctx: *mut c_void,
+) {
+    let (Some(node), Some(endpoint), Some(sink)) = (node_ref(node), cstr(endpoint), sink) else {
+        return;
+    };
+    let bytes = catch(Vec::new(), || {
+        node.sign_reach_record(endpoint.to_string(), ttl_secs)
+    });
+    sink(ctx, bytes.as_ptr(), bytes.len());
+}
+
+/// Verify a reachability record. `now_secs` = current Unix time to enforce expiry (0 skips the expiry
+/// check). Returns true iff valid; on a valid record invokes `sink(ctx, address32, endpoint_cstr,
+/// issued_at, ttl_secs)` once. Self-certifying: the record is checked against the address it names,
+/// no external anchor. `bytes`/`len` is the record from `hop_sign_reach_record`.
+#[no_mangle]
+pub unsafe extern "C" fn hop_verify_reach_record(
+    bytes: *const u8,
+    len: usize,
+    now_secs: u64,
+    sink: Option<
+        extern "C" fn(
+            ctx: *mut c_void,
+            address: *const u8,
+            endpoint: *const c_char,
+            issued_at: u64,
+            ttl_secs: u32,
+        ),
+    >,
+    ctx: *mut c_void,
+) -> bool {
+    let now = if now_secs == 0 { None } else { Some(now_secs) };
+    let rec = catch(None, || {
+        hop_core::reach::ReachRecord::verify(slice(bytes, len), now)
+    });
+    match rec {
+        Some(r) => {
+            if let Some(sink) = sink {
+                let ep = std::ffi::CString::new(r.claim.endpoint).unwrap_or_default();
+                sink(
+                    ctx,
+                    r.claim.address.as_ptr(),
+                    ep.as_ptr(),
+                    r.claim.issued_at,
+                    r.claim.ttl_secs,
+                );
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1724,6 +1788,84 @@ mod tests {
             assert_eq!(inbox[0].2.as_slice(), &body[..]);
             hop_node_free(a);
             hop_node_free(b);
+        }
+    }
+
+    // ---- reachability records through the ABI ----
+    struct BytesOut {
+        bytes: Vec<u8>,
+    }
+    extern "C" fn reach_sign_sink(ctx: *mut c_void, bytes: *const u8, len: usize) {
+        unsafe {
+            (*(ctx as *mut BytesOut)).bytes = slice(bytes, len).to_vec();
+        }
+    }
+    struct ReachOut {
+        address: Vec<u8>,
+        endpoint: String,
+        ttl_secs: u32,
+    }
+    extern "C" fn reach_verify_sink(
+        ctx: *mut c_void,
+        address: *const u8,
+        endpoint: *const c_char,
+        _issued_at: u64,
+        ttl_secs: u32,
+    ) {
+        unsafe {
+            let o = &mut *(ctx as *mut ReachOut);
+            o.address = slice(address, 32).to_vec();
+            o.endpoint = CStr::from_ptr(endpoint).to_string_lossy().into_owned();
+            o.ttl_secs = ttl_secs;
+        }
+    }
+
+    #[test]
+    fn reach_record_signs_and_verifies_through_the_abi() {
+        unsafe {
+            let node = hop_node_new();
+            hop_node_tick(node, 1_700_000_000_000); // ms clock => issued_at 1_700_000_000s
+            let mut addr = [0u8; 32];
+            assert!(hop_node_address(node, addr.as_mut_ptr()));
+
+            let ep = std::ffi::CString::new("wss://myaddress.com/_hop").unwrap();
+            let mut signed = BytesOut { bytes: Vec::new() };
+            hop_sign_reach_record(
+                node,
+                ep.as_ptr(),
+                3600,
+                Some(reach_sign_sink),
+                &mut signed as *mut _ as *mut c_void,
+            );
+            assert!(!signed.bytes.is_empty(), "sign produced a record");
+
+            let mut v = ReachOut {
+                address: vec![],
+                endpoint: String::new(),
+                ttl_secs: 0,
+            };
+            let ok = hop_verify_reach_record(
+                signed.bytes.as_ptr(),
+                signed.bytes.len(),
+                1_700_000_100, // within the 3600s ttl
+                Some(reach_verify_sink),
+                &mut v as *mut _ as *mut c_void,
+            );
+            assert!(ok, "a valid record verifies through the ABI");
+            assert_eq!(v.address, addr, "self-certifies THIS node's address");
+            assert_eq!(v.endpoint, "wss://myaddress.com/_hop");
+            assert_eq!(v.ttl_secs, 3600);
+
+            // Tamper one byte: verification must fail (self-certifying, no anchor bypass).
+            let mut bad = signed.bytes.clone();
+            let last = bad.len() - 1;
+            bad[last] ^= 0xff;
+            assert!(
+                !hop_verify_reach_record(bad.as_ptr(), bad.len(), 0, None, std::ptr::null_mut()),
+                "a tampered record is rejected"
+            );
+
+            hop_node_free(node);
         }
     }
 

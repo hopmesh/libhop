@@ -255,6 +255,44 @@ pub struct HnsCacheEntry {
     pub ttl_secs: u32,
 }
 
+/// A verified reachability record (see `HopNode::sign_reach_record` + `verify_reach_record`).
+/// `valid` false = the signature failed or the record expired; the other fields are then meaningless.
+#[cfg_attr(feature = "full", derive(uniffi::Record))]
+pub struct ReachInfo {
+    pub valid: bool,
+    /// The reachable Hop address (32 bytes) the record self-certifies.
+    pub address: Vec<u8>,
+    /// The endpoint spec, e.g. `wss://myaddress.com/_hop` or `1.2.3.4:9944`.
+    pub endpoint: String,
+    pub issued_at: u64,
+    pub ttl_secs: u32,
+}
+
+/// Verify a self-certifying reachability record (from `HopNode::sign_reach_record`, a
+/// `/.well-known/hop` body, or gossip). `now_secs` = current Unix time to enforce expiry, or 0 to
+/// skip the expiry check. Returns `valid=true` iff the signature is by the address the record names
+/// and (when checked) it is unexpired. No trust anchor is consulted; the record certifies itself.
+#[cfg_attr(feature = "full", uniffi::export)]
+pub fn verify_reach_record(bytes: Vec<u8>, now_secs: u64) -> ReachInfo {
+    let now = if now_secs == 0 { None } else { Some(now_secs) };
+    match hop_core::reach::ReachRecord::verify(&bytes, now) {
+        Some(r) => ReachInfo {
+            valid: true,
+            address: r.claim.address.to_vec(),
+            endpoint: r.claim.endpoint,
+            issued_at: r.claim.issued_at,
+            ttl_secs: r.claim.ttl_secs,
+        },
+        None => ReachInfo {
+            valid: false,
+            address: Vec::new(),
+            endpoint: String::new(),
+            issued_at: 0,
+            ttl_secs: 0,
+        },
+    }
+}
+
 /// Outcome of starting an HNS resolution (DESIGN.md §30).
 #[cfg_attr(feature = "full", derive(uniffi::Enum))]
 pub enum HnsLookupResult {
@@ -1023,6 +1061,14 @@ impl HopNode {
                 address: r.address.map(|a| a.to_vec()).unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Sign a self-certifying reachability record for this node's address, binding it to `endpoint`
+    /// (e.g. `wss://myaddress.com/_hop`) for `ttl_secs`. Serve the bytes at `/.well-known/hop` or
+    /// gossip them; verify with the free `verify_reach_record`. No DNS/DNSSEC needed: the record is
+    /// signed by the address it names (DESIGN.md §30 endpoint discovery).
+    pub fn sign_reach_record(&self, endpoint: String, ttl_secs: u32) -> Vec<u8> {
+        self.node().sign_reach_record(endpoint, ttl_secs).to_bytes()
     }
 
     // ---- hps:// pub/sub: services & channels (DESIGN.md §32) ------------------------------
