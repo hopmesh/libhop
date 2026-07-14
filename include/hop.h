@@ -219,6 +219,11 @@ bool hop_cluster_would_drop(const struct HopNode *node,
 // Live replica count (self + peers within the membership TTL); 1 if not clustered, 0 if `node` null.
 uint32_t hop_cluster_members(const struct HopNode *node);
 
+// Require at least `min_live_members` visible before this replica processes anything (phase 3
+// hold-until-coordinated / CP). Set it to a MAJORITY of your replica count so a partition minority
+// holds instead of double-processing. `0` disables it (AP: process what you own among who you see).
+void hop_cluster_set_quorum(const struct HopNode *node, uint32_t min_live_members);
+
 // Drain hops:// service requests addressed to this node (host side). Invokes
 // `sink(ctx, from32, request_id32, service_cstr, method_cstr, args_ptr, args_len)` per request.
 void hop_poll_service_requests(const struct HopNode *node,

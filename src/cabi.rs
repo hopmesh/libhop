@@ -616,6 +616,18 @@ pub unsafe extern "C" fn hop_cluster_members(node: *const HopNode) -> u32 {
     })
 }
 
+/// Require at least `min_live_members` visible before this replica processes anything (phase 3
+/// hold-until-coordinated / CP). Set it to a MAJORITY of your replica count so a partition minority
+/// holds instead of double-processing. `0` disables it (AP: process what you own among who you see).
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_set_quorum(node: *const HopNode, min_live_members: u32) {
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            node.cluster_quorum(min_live_members);
+        }
+    })
+}
+
 /// Drain hops:// service requests addressed to this node (host side). Invokes
 /// `sink(ctx, from32, request_id32, service_cstr, method_cstr, args_ptr, args_len)` per request.
 #[no_mangle]

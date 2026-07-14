@@ -607,6 +607,13 @@ impl HopNode {
     pub fn cluster_members(&self) -> u32 {
         self.node().cluster_members() as u32
     }
+
+    /// Require at least `min_live_members` visible before this replica processes anything (phase 3
+    /// hold-until-coordinated / CP). Majority of your replica count => a partition minority holds
+    /// instead of double-processing. 0 disables it (AP).
+    pub fn cluster_quorum(&self, min_live_members: u32) {
+        self.node().cluster_quorum(min_live_members as usize);
+    }
 }
 
 /// A fresh EPHEMERAL store (core-ffi-03). The full build uses an in-memory SQLite; the embedded build
