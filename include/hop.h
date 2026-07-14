@@ -197,6 +197,13 @@ bool hop_send_service_response(const struct HopNode *node,
 void hop_cluster_join(const struct HopNode *node,
                       const uint8_t *secret);
 
+// Join the endpoint cluster from a passphrase (the 32-byte secret is derived from it): every replica
+// given the same string joins the same cluster, across languages and the standalone service. This is
+// the ergonomic entry point; `hop_cluster_join` takes a raw 32-byte secret. No-op if `pass` is null.
+void hop_cluster_join_passphrase(const struct HopNode *node,
+                                 const uint8_t *pass,
+                                 uintptr_t pass_len);
+
 // Explicit completion for a fire-and-forget handler (one that sends no response): mark request
 // `(from32, request_id32)` handled and gossip it so sibling replicas drop their copies.
 void hop_cluster_mark_done(const struct HopNode *node,

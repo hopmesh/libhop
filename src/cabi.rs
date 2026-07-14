@@ -552,6 +552,22 @@ pub unsafe extern "C" fn hop_cluster_join(node: *const HopNode, secret: *const u
     })
 }
 
+/// Join the endpoint cluster from a passphrase (the 32-byte secret is derived from it): every replica
+/// given the same string joins the same cluster, across languages and the standalone service. This is
+/// the ergonomic entry point; `hop_cluster_join` takes a raw 32-byte secret. No-op if `pass` is null.
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_join_passphrase(
+    node: *const HopNode,
+    pass: *const u8,
+    pass_len: usize,
+) {
+    catch((), || {
+        if let Some(node) = node_ref(node) {
+            node.cluster_join_passphrase(slice(pass, pass_len));
+        }
+    })
+}
+
 /// Explicit completion for a fire-and-forget handler (one that sends no response): mark request
 /// `(from32, request_id32)` handled and gossip it so sibling replicas drop their copies.
 #[no_mangle]

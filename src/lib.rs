@@ -586,6 +586,13 @@ impl HopNode {
         self.node().cluster_join(secret);
     }
 
+    /// Join the endpoint cluster from a passphrase (the 32-byte secret is derived from it), so every
+    /// replica configured with the same string joins the same cluster, across languages and the
+    /// standalone service (which reads it from `HOP_CLUSTER_SECRET`).
+    pub fn cluster_join_passphrase(&self, passphrase: &[u8]) {
+        self.node().cluster_join_passphrase(passphrase);
+    }
+
     /// Explicit completion for a fire-and-forget handler: mark `(from, id)` handled + gossip it.
     pub fn cluster_mark_done(&self, from: [u8; 32], id: [u8; 32]) {
         self.node().cluster_mark_done(&from, &id);
