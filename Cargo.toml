@@ -16,6 +16,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 hop-core.workspace = true
+hop-endpoint-core.workspace = true
 # default-features = false so a mobile build can pick plain `bundled` OR encrypted `sqlcipher`
 # (they'd conflict if both bundling backends were active). The `bundled`/`sqlcipher` features below
 # forward the choice; the workspace default keeps plain SQLite for `cargo test --workspace`.

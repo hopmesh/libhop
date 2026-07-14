@@ -530,6 +530,76 @@ pub unsafe extern "C" fn hop_send_service_response(
     })
 }
 
+// ---- endpoint cluster coordination (DESIGN.md §40) --------------------------------------------
+//
+// Self-clustering endpoint replicas (same identity, no shared datastore) dedup addressed requests
+// among themselves over an `hps://` cluster topic (implemented in the `hop-endpoint-core` crate).
+// The gate is TRANSPARENT: after hop_cluster_join, a request a sibling already handled is dropped
+// before hop_poll_service_requests surfaces it, so every SDK gets dedup by adding one join call.
+// Additive to the ABI (no existing signature changed), so HOP_ABI_VERSION is unchanged.
+
+/// Join the endpoint cluster keyed by the 32-byte `secret` (all replicas of one endpoint pass the
+/// same secret). `hop_send_service_response` marks a request complete for the siblings automatically;
+/// a fire-and-forget handler calls `hop_cluster_mark_done`. No-op if `secret` is null.
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_join(node: *const HopNode, secret: *const u8) {
+    catch((), || {
+        if let (Some(node), false) = (node_ref(node), secret.is_null()) {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(slice(secret, 32));
+            node.cluster_join(s);
+        }
+    })
+}
+
+/// Explicit completion for a fire-and-forget handler (one that sends no response): mark request
+/// `(from32, request_id32)` handled and gossip it so sibling replicas drop their copies.
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_mark_done(
+    node: *const HopNode,
+    from: *const u8,
+    request_id: *const u8,
+) {
+    catch((), || {
+        if let (Some(node), false, false) = (node_ref(node), from.is_null(), request_id.is_null()) {
+            let mut f = [0u8; 32];
+            let mut i = [0u8; 32];
+            f.copy_from_slice(slice(from, 32));
+            i.copy_from_slice(slice(request_id, 32));
+            node.cluster_mark_done(f, i);
+        }
+    })
+}
+
+/// Whether request `(from32, request_id32)` would be dropped as already handled by a sibling replica
+/// (introspection; the poll path applies this automatically). False if `node` is null or unclustered.
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_would_drop(
+    node: *const HopNode,
+    from: *const u8,
+    request_id: *const u8,
+) -> bool {
+    catch(false, || {
+        let (Some(node), false, false) = (node_ref(node), from.is_null(), request_id.is_null())
+        else {
+            return false;
+        };
+        let mut f = [0u8; 32];
+        let mut i = [0u8; 32];
+        f.copy_from_slice(slice(from, 32));
+        i.copy_from_slice(slice(request_id, 32));
+        node.cluster_would_drop(f, i)
+    })
+}
+
+/// Live replica count (self + peers within the membership TTL); 1 if not clustered, 0 if `node` null.
+#[no_mangle]
+pub unsafe extern "C" fn hop_cluster_members(node: *const HopNode) -> u32 {
+    catch(0, || {
+        node_ref(node).map(|n| n.cluster_members()).unwrap_or(0)
+    })
+}
+
 /// Drain hops:// service requests addressed to this node (host side). Invokes
 /// `sink(ctx, from32, request_id32, service_cstr, method_cstr, args_ptr, args_len)` per request.
 #[no_mangle]

@@ -14,6 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use hop_core::prelude::*;
+use hop_endpoint_core::Endpoint;
 
 // core-ffi-sdk-r2-02: the SQLite store is compiled iff the `full` feature is on (that is the feature
 // that actually pulls in `dep:hop-store-sqlite`). The old gate keyed the alias off `not(minimal)`,
@@ -458,7 +459,7 @@ fn to32(v: &[u8]) -> std::result::Result<[u8; 32], FfiError> {
 /// the foreign side as a reference-counted object.
 #[cfg_attr(feature = "full", derive(uniffi::Object))]
 pub struct HopNode {
-    inner: Mutex<Node<HopStore>>,
+    inner: Mutex<Endpoint<HopStore>>,
     /// True iff this node has durable storage. `open` sets it false only when the db path was
     /// unusable even after quarantine, so the host can tell the difference between persistent
     /// and silently-ephemeral (F-26). `new`/`with_secret` are ephemeral by construction.
@@ -556,7 +557,7 @@ fn open_node_inner(db_path: &str, secret: &[u8], app_secret: &[u8], key: &[u8]) 
         );
     }
     Arc::new(HopNode {
-        inner: Mutex::new(node),
+        inner: Mutex::new(Endpoint::new(node)),
         persistent,
         rehydrate_dropped: report.total(),
     })
@@ -569,10 +570,35 @@ impl HopNode {
     /// until the app restarts. The node's own state is a plain in-memory structure with no cross-call
     /// invariant that a mid-mutation panic could leave in an unsafe-to-observe state, so recovering the
     /// guard is the right call: one bad call degrades to a dropped operation, not a dead node.
-    fn node(&self) -> std::sync::MutexGuard<'_, Node<HopStore>> {
+    fn node(&self) -> std::sync::MutexGuard<'_, Endpoint<HopStore>> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Endpoint cluster coordination (DESIGN.md §40). Kept OUT of the `uniffi::export` block (fixed
+    // arrays are not a UniFFI type; the mobile client SDKs do not cluster), reachable via the C ABI.
+    // These delegate to the `Endpoint` wrapper; `tick` / service polling already cluster through it.
+
+    /// Join the endpoint cluster keyed by `secret`. Dedup then applies transparently: a request a
+    /// sibling replica already handled is dropped before it is surfaced to the app.
+    pub fn cluster_join(&self, secret: [u8; 32]) {
+        self.node().cluster_join(secret);
+    }
+
+    /// Explicit completion for a fire-and-forget handler: mark `(from, id)` handled + gossip it.
+    pub fn cluster_mark_done(&self, from: [u8; 32], id: [u8; 32]) {
+        self.node().cluster_mark_done(&from, &id);
+    }
+
+    /// Whether request `(from, id)` would be dropped as already handled by a sibling replica.
+    pub fn cluster_would_drop(&self, from: [u8; 32], id: [u8; 32]) -> bool {
+        self.node().cluster_would_drop(&from, &id)
+    }
+
+    /// Live replica count (self + peers within the membership TTL); 1 if not clustered.
+    pub fn cluster_members(&self) -> u32 {
+        self.node().cluster_members() as u32
     }
 }
 
@@ -595,10 +621,10 @@ impl HopNode {
     #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Node::with_store(
+            inner: Mutex::new(Endpoint::new(Node::with_store(
                 Identity::generate(),
                 fresh_ephemeral_store(),
-            )),
+            ))),
             persistent: false,
             rehydrate_dropped: 0,
         })
@@ -609,10 +635,10 @@ impl HopNode {
     #[cfg_attr(feature = "full", uniffi::constructor)]
     pub fn with_secret(secret: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(Node::with_store(
+            inner: Mutex::new(Endpoint::new(Node::with_store(
                 identity_from(&secret),
                 fresh_ephemeral_store(),
-            )),
+            ))),
             persistent: false,
             rehydrate_dropped: 0,
         })
@@ -657,7 +683,7 @@ impl HopNode {
                 node.set_app_keys(hop_core::app::AppKeys::from_secret(s));
             }
             Arc::new(Self {
-                inner: Mutex::new(node),
+                inner: Mutex::new(Endpoint::new(node)),
                 persistent: false,
                 rehydrate_dropped: 0,
             })
@@ -2099,5 +2125,39 @@ mod tests {
         assert_eq!(info.name, "Bob's Phone");
         assert_eq!(info.kind, "device");
         assert_eq!(info.address, b.address());
+    }
+
+    #[test]
+    fn abi_cluster_dedup_propagates_between_replicas() {
+        // Two HopNodes with the SAME identity (endpoint replicas) cluster over the ABI: A marking a
+        // request handled propagates to B via the cluster topic, so B would drop that same request.
+        // Proves HopNode delegates to the Endpoint layer end to end (join + gossip + gate).
+        let secret = vec![5u8; 32];
+        let a = HopNode::with_secret(secret.clone());
+        let b = HopNode::with_secret(secret);
+        assert_eq!(a.address(), b.address(), "replicas share the identity");
+        let cs = [7u8; 32];
+        a.cluster_join(cs);
+        b.cluster_join(cs);
+        link(&a, &b); // establish the A <-> B link (link id 1) the gossip rides
+
+        let from = [1u8; 32];
+        let id = [2u8; 32];
+        assert!(!b.cluster_would_drop(from, id), "B has not learned it yet");
+
+        a.cluster_mark_done(from, id);
+        a.tick(2_000);
+        pump(&a, &b);
+        b.tick(2_000); // B drains + applies the inbound gossip
+
+        assert!(
+            b.cluster_would_drop(from, id),
+            "B learned A's HANDLED via the ABI cluster path"
+        );
+        assert!(b.cluster_members() >= 2, "the replicas see each other");
+        assert!(
+            !b.cluster_would_drop(from, [9u8; 32]),
+            "unrelated request not dropped"
+        );
     }
 }

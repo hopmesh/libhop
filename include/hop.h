@@ -191,6 +191,27 @@ bool hop_send_service_response(const struct HopNode *node,
                                const uint8_t *body,
                                uintptr_t body_len);
 
+// Join the endpoint cluster keyed by the 32-byte `secret` (all replicas of one endpoint pass the
+// same secret). `hop_send_service_response` marks a request complete for the siblings automatically;
+// a fire-and-forget handler calls `hop_cluster_mark_done`. No-op if `secret` is null.
+void hop_cluster_join(const struct HopNode *node,
+                      const uint8_t *secret);
+
+// Explicit completion for a fire-and-forget handler (one that sends no response): mark request
+// `(from32, request_id32)` handled and gossip it so sibling replicas drop their copies.
+void hop_cluster_mark_done(const struct HopNode *node,
+                           const uint8_t *from,
+                           const uint8_t *request_id);
+
+// Whether request `(from32, request_id32)` would be dropped as already handled by a sibling replica
+// (introspection; the poll path applies this automatically). False if `node` is null or unclustered.
+bool hop_cluster_would_drop(const struct HopNode *node,
+                            const uint8_t *from,
+                            const uint8_t *request_id);
+
+// Live replica count (self + peers within the membership TTL); 1 if not clustered, 0 if `node` null.
+uint32_t hop_cluster_members(const struct HopNode *node);
+
 // Drain hops:// service requests addressed to this node (host side). Invokes
 // `sink(ctx, from32, request_id32, service_cstr, method_cstr, args_ptr, args_len)` per request.
 void hop_poll_service_requests(const struct HopNode *node,
