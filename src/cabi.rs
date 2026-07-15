@@ -616,9 +616,8 @@ pub unsafe extern "C" fn hop_cluster_members(node: *const HopNode) -> u32 {
     })
 }
 
-/// Require at least `min_live_members` visible before this replica processes anything (phase 3
-/// hold-until-coordinated / CP). Set it to a MAJORITY of your replica count so a partition minority
-/// holds instead of double-processing. `0` disables it (AP: process what you own among who you see).
+/// Require at least `min_live_members` recently visible before processing. This TTL-based threshold
+/// is a conservative failover heuristic, not consensus or an at-most-once guarantee. `0` disables it.
 #[no_mangle]
 pub unsafe extern "C" fn hop_cluster_set_quorum(node: *const HopNode, min_live_members: u32) {
     catch((), || {

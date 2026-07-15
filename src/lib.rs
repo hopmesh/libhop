@@ -608,9 +608,8 @@ impl HopNode {
         self.node().cluster_members() as u32
     }
 
-    /// Require at least `min_live_members` visible before this replica processes anything (phase 3
-    /// hold-until-coordinated / CP). Majority of your replica count => a partition minority holds
-    /// instead of double-processing. 0 disables it (AP).
+    /// Require at least `min_live_members` recently visible before processing. This TTL-based
+    /// threshold is a conservative failover heuristic, not consensus or an at-most-once guarantee.
     pub fn cluster_quorum(&self, min_live_members: u32) {
         self.node().cluster_quorum(min_live_members as usize);
     }
