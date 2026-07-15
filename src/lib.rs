@@ -1088,7 +1088,7 @@ impl HopNode {
 
     /// Sign a self-certifying reachability record for this node's address, binding it to `endpoint`
     /// (e.g. `wss://myaddress.com/_hop`) for `ttl_secs`. Serve the bytes at `/.well-known/hop` or
-    /// gossip them; verify with the free `verify_reach_record`. No DNS/DNSSEC needed: the record is
+    /// gossip them; verify with the free `verify_reach_record`. No DNS needed: the record is
     /// signed by the address it names (DESIGN.md §30 endpoint discovery).
     pub fn sign_reach_record(&self, endpoint: String, ttl_secs: u32) -> Vec<u8> {
         self.node().sign_reach_record(endpoint, ttl_secs).to_bytes()
